@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MWGL Studio v2</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="app">
+    <div class="panel">
+      <h1>MWGL Studio <span class="ver">v2</span></h1>
+      <p class="desc">
+        <strong>MWGL v2</strong>：节点含 <code>start</code>（唯一入口）、<code>wait_user</code>（等待用户交互，中间节点）、<code>switch</code>、<code>loop_start</code>/<code>loop_end</code>（循环开始/结束，可在两者间插入复杂逻辑）、<code>parallel</code>（并行分支）、<code>case</code>、<code>success</code> / <code>failure</code>（终态无出边）。边主要表达顺序连接，<code>label</code> 承载分支/触发条件语义。图保持 DAG，勿用连线回环。紧凑文本支持 <code>RULE</code>、<code>VERSION 2</code>、<code>开始</code>、<code>条件</code>、<code>CASE</code>；复杂图用 <code>MODE graph</code> + <code>NODE</code>/<code>EDGE</code>。
+      </p>
+    </div>
+
+    <div class="panel inputs">
+      <div class="session-bar">
+        <label for="sessionSelect">会话窗口</label>
+        <div class="toolbar">
+          <select id="sessionSelect"></select>
+          <button id="btnUndoWorkflow" type="button" title="后退（Ctrl/Cmd+Z）">后退</button>
+          <button id="btnRedoWorkflow" type="button" title="前进（Ctrl/Cmd+Y 或 Shift+Ctrl/Cmd+Z）">前进</button>
+          <span id="historyHint" class="history-hint">后退 0 | 前进 0</span>
+          <button id="btnNewSession" type="button">新建窗口</button>
+          <button id="btnDeleteSession" type="button" class="btn-danger">删除窗口</button>
+        </div>
+      </div>
+      <div>
+        <div>
+          <label for="apiBase">后端代理 Base URL</label>
+          <input id="apiBase" value="http://localhost:3001" />
+        </div>
+      </div>
+      <div>
+        <label for="userPrompt">用户输入（自然语言）</label>
+        <textarea id="userPrompt" placeholder="例如：当订单支付成功，条件 金额是否大于1000，CASE &quot;是&quot; 通知财务；CASE &quot;否&quot; 记录日志"></textarea>
+      </div>
+      <div class="toolbar">
+        <button class="btn-primary" id="btnGenerate">调用 DeepSeek 生成 MWGL</button>
+        <label class="chk-inline" title="开启后会携带上一轮需求与当前工作流，按增量修改方式生成">
+          <input type="checkbox" id="chkContextMode" checked />
+          <span>上下文增量模式</span>
+        </label>
+        <label class="chk-inline" title="生成成功后自动调用 /api/mwgl/optimize（MCTS），耗时更长">
+          <input type="checkbox" id="chkPostMcts" checked />
+          <span>生成后 MCTS 优化</span>
+        </label>
+        <button id="btnParseMwgl">从 MWGL 文本导入</button>
+        <button id="btnExportMwgl">导出 MWGL 文本</button>
+        <button id="btnExportJson">导出 JSON</button>
+        <button id="btnPseudocode">生成伪代码</button>
+        <button id="btnGenCode">生成代码</button>
+        <button id="btnRunCode">快速自检运行</button>
+        <select id="codeLanguage" style="width:auto;padding:4px 8px;font-size:13px;">
+          <option value="Python">Python</option>
+          <option value="JavaScript">JavaScript</option>
+          <option value="Java">Java</option>
+          <option value="C++">C++</option>
+          <option value="Go">Go</option>
+        </select>
+      </div>
+      <div class="status" id="status"></div>
+      <aside class="error-panel hidden" id="constraintPanel" aria-live="polite">
+        <div class="error-panel-title">约束错误</div>
+        <ul class="error-list" id="constraintList"></ul>
+      </aside>
+    </div>
+
+    <div class="workbench">
+      <div class="panel">
+        <div class="toolbar toolbar-nodes">
+          <button id="addEvent">start</button>
+          <button id="addWaitUser">wait_user</button>
+          <button id="addSwitch">switch</button>
+          <button id="addLoopStart">loop_start</button>
+          <button id="addLoopEnd">loop_end</button>
+          <button id="addParallel">parallel</button>
+          <button id="addCase">case</button>
+          <button id="addSuccess">success</button>
+          <button id="addFailure">failure</button>
+          <button id="btnLayoutLr" type="button">从左到右排列</button>
+        </div>
+        <div class="canvas" id="canvas" tabindex="0">
+          <div class="canvas-viewport" id="canvasViewport">
+            <div class="canvas-world" id="canvasWorld"></div>
+          </div>
+        </div>
+        <div class="hint">工作流默认居中在画布内；空白处拖拽平移；Ctrl+滚轮缩放；节点可拖动；Shift+拖节点可连线；点击边可选中并按 Delete/Backspace 删除。</div>
+      </div>
+
+      <div class="panel">
+        <label for="nodeType">节点类型</label>
+        <select id="nodeType">
+          <option value="start">start</option>
+          <option value="wait_user">wait_user</option>
+          <option value="switch">switch</option>
+          <option value="loop_start">loop_start</option>
+          <option value="loop_end">loop_end</option>
+          <option value="parallel">parallel</option>
+          <option value="case">case</option>
+          <option value="success">success</option>
+          <option value="failure">failure</option>
+        </select>
+        <label for="nodeText">节点文本</label>
+        <textarea id="nodeText" placeholder="节点显示内容。需反复判断时合并为一个 case，并以【循环】开头写明语义"></textarea>
+        <div class="grid-2">
+          <div>
+            <label for="nodeX">X（画布中心为 0，右为正）</label>
+            <input id="nodeX" type="number" />
+          </div>
+          <div>
+            <label for="nodeY">Y（画布中心为 0，下为正）</label>
+            <input id="nodeY" type="number" />
+          </div>
+        </div>
+        <div class="toolbar" style="margin-top:8px;">
+          <button id="saveNode" class="btn-primary">保存节点修改</button>
+          <button id="deleteNode" class="btn-danger">删除节点</button>
+        </div>
+        <div class="hint">没有选中节点时，将自动选择第一个节点。</div>
+        <hr class="section-line" />
+        <label for="edgeFrom">连线起点</label>
+        <select id="edgeFrom"></select>
+        <label for="edgeTo">连线终点</label>
+        <select id="edgeTo"></select>
+        <label for="edgeLabel">分支/触发条件标签（switch 出发必填）</label>
+        <input id="edgeLabel" placeholder="例如：已认证、金额>1000" />
+        <label for="edgeSelect">已有连线</label>
+        <select id="edgeSelect"></select>
+        <div class="toolbar" style="margin-top:8px;">
+          <button id="saveEdge" class="btn-primary">新增/更新连线</button>
+          <button id="deleteEdge" class="btn-danger">删除连线</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="split">
+      <div class="panel">
+        <label for="mwglText">MWGL 文本</label>
+        <textarea id="mwglText"></textarea>
+      </div>
+      <div class="panel">
+        <label>JSON（工作流结构）</label>
+        <pre id="jsonView"></pre>
+      </div>
+    </div>
+
+    <div class="split" style="margin-top:2px;">
+      <div class="panel" style="grid-column: 1 / -1;">
+        <label for="pseudocodeText">伪代码（DAG → 结构化伪代码，可手动编辑）</label>
+        <textarea id="pseudocodeText" placeholder="点击「生成伪代码」，将当前 DAG 工作流转换为结构化伪代码。"></textarea>
+      </div>
+    </div>
+
+    <div class="split" style="margin-top:2px;">
+      <div class="panel" style="grid-column: 1 / -1;">
+        <label for="codeText">真实代码（伪代码 → 可执行代码，可手动编辑）</label>
+        <textarea id="codeText" placeholder="先生成伪代码，再点击「生成代码」，将伪代码转换为指定语言的真实代码。"></textarea>
+      </div>
+    </div>
+    <div class="split" style="margin-top:2px;">
+      <div class="panel" style="grid-column: 1 / -1;">
+        <label for="runResultText">运行结果（快速自检）</label>
+        <textarea id="runResultText" placeholder="点击「快速自检运行」后显示 stdout/stderr/退出码。" readonly></textarea>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="./js/main.js"></script>
+</body>
+</html>
