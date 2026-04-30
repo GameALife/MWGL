@@ -480,9 +480,32 @@ const OPERATORS = [
   opRenameTextForSemantics
 ];
 
+function listValidOperatorChoices(parentWorkflow, maxNodes) {
+  const validChoices = [];
+  for (const opFn of OPERATORS) {
+    const candidate = opFn(parentWorkflow);
+    if (!candidate) continue;
+    if ((candidate.workflow.nodes || []).length > maxNodes) continue;
+    const normalized = normalizeWorkflow(candidate.workflow);
+    const check = validateWorkflowConstraints(normalized);
+    if (!check.ok) continue;
+    validChoices.push({
+      op: candidate.op,
+      workflow: normalized
+    });
+  }
+  return validChoices;
+}
+
 async function mutateWorkflowViaLlm(parentWorkflow, maxNodes, context) {
   const llmMutator = context?.llmMutator;
   if (!llmMutator?.url && !(llmMutator?.base_url && llmMutator?.api_key && llmMutator?.model)) return null;
+  const validChoices = listValidOperatorChoices(parentWorkflow, maxNodes);
+  if (validChoices.length === 0) {
+    return { rejected: true, reason: "no_legal_operator_available" };
+  }
+  const availableOps = validChoices.map((x) => x.op);
+  const validChoiceByOp = new Map(validChoices.map((x) => [x.op, x]));
   let timer = null;
   try {
     const ctrl = new AbortController();
@@ -500,10 +523,12 @@ async function mutateWorkflowViaLlm(parentWorkflow, maxNodes, context) {
           prompt: llmMutator.pass_through_prompt ? context?.prompt || "" : "",
           workflow: parentWorkflow,
           max_nodes: maxNodes,
+          available_operators: availableOps,
           model: llmMutator.model || undefined,
           temperature: llmMutator.temperature,
           max_tokens: llmMutator.max_tokens,
-          hint: "Return JSON with workflow (or candidates[]) that follows MWGL schema."
+          hint:
+            "Return strict JSON only: {'decision':'choose','op':'<one_of_available_operators>'} or {'decision':'reject','reason':'...'}."
         })
       });
     } else {
@@ -525,14 +550,15 @@ async function mutateWorkflowViaLlm(parentWorkflow, maxNodes, context) {
             {
               role: "system",
               content:
-                "You optimize MWGL workflows. Return strict JSON only: {\"workflow\":{...},\"op\":\"llm_direct\"} or {\"candidates\":[{\"workflow\":{...},\"op\":\"...\"}]}"
+                "You are an MWGL mutation operator selector. You must select exactly one operator from available_operators, or reject when none can safely improve. Return strict JSON only: {'decision':'choose','op':'...'} or {'decision':'reject','reason':'...'}."
             },
             {
               role: "user",
               content: JSON.stringify({
                 prompt: llmMutator.pass_through_prompt ? context?.prompt || "" : "",
                 workflow: parentWorkflow,
-                max_nodes: maxNodes
+                max_nodes: maxNodes,
+                available_operators: availableOps
               })
             }
           ]
@@ -550,22 +576,14 @@ async function mutateWorkflowViaLlm(parentWorkflow, maxNodes, context) {
         return null;
       }
     }
-    const candidates = [];
-    if (payload?.workflow && typeof payload.workflow === "object") {
-      candidates.push({ workflow: payload.workflow, op: payload.op || "llm_mutation" });
+    const decision = String(payload?.decision || "").trim().toLowerCase();
+    if (decision === "reject") {
+      return { rejected: true, reason: String(payload?.reason || "llm_rejected") };
     }
-    if (Array.isArray(payload?.candidates)) {
-      for (const item of payload.candidates) {
-        if (item?.workflow && typeof item.workflow === "object") {
-          candidates.push({ workflow: item.workflow, op: item.op || "llm_mutation" });
-        }
-      }
-    }
-    for (const c of candidates) {
-      if ((c.workflow.nodes || []).length > maxNodes) continue;
-      return c;
-    }
-    return null;
+    const opName = String(payload?.op || "").trim();
+    const picked = validChoiceByOp.get(opName);
+    if (!picked) return null;
+    return { workflow: picked.workflow, op: picked.op };
   } catch (_error) {
     return null;
   } finally {
@@ -578,19 +596,11 @@ async function mutateWorkflow(parentWorkflow, maxNodes, context) {
   const hasLlmEndpoint = Boolean(
     llmMutator?.url || (llmMutator?.base_url && llmMutator?.api_key && llmMutator?.model)
   );
-  const preferLlm = hasLlmEndpoint && Math.random() < (llmMutator?.mutation_ratio || 0);
-  if (preferLlm) {
-    const llmCandidate = await mutateWorkflowViaLlm(parentWorkflow, maxNodes, context);
-    if (llmCandidate) return llmCandidate;
+  if (!hasLlmEndpoint) {
+    return null;
   }
-  for (let i = 0; i < 6; i += 1) {
-    const op = randomItem(OPERATORS);
-    if (!op) break;
-    const candidate = op(parentWorkflow);
-    if (!candidate) continue;
-    if ((candidate.workflow.nodes || []).length > maxNodes) continue;
-    return candidate;
-  }
+  const llmCandidate = await mutateWorkflowViaLlm(parentWorkflow, maxNodes, context);
+  if (llmCandidate && !llmCandidate.rejected) return llmCandidate;
   return null;
 }
 
@@ -939,6 +949,14 @@ router.post("/api/mwgl/optimize", async (req, res) => {
     const evalDataset = selectRelevantEvalDataset(rawEvalDataset, prompt, config);
     const evaluator = mergeEvaluatorConfig(req.body?.evaluator);
     const llmMutator = mergeLlmMutatorConfig(req.body?.llm_mutator);
+    const llmEnabled = Boolean(llmMutator.url || (llmMutator.base_url && llmMutator.api_key && llmMutator.model));
+    if (!llmEnabled) {
+      return res.status(422).json({
+        error: "llm_mutator is required in strict_llm_operator_mode",
+        details:
+          "Provide llm_mutator.url OR (llm_mutator.base_url + llm_mutator.api_key + llm_mutator.model)."
+      });
+    }
     const context = { prompt, evaluator, llmMutator };
 
     const validSeeds = [];
