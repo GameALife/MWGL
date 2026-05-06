@@ -58,17 +58,41 @@ export async function fetchEvalDataset({ base }) {
 }
 
 /**
- * 对已生成的工作流做 MCTS 优化（依赖同源的 optimize + mock-evaluator）。
+ * 对已生成的工作流调用 `/api/mwgl/optimize`（束搜索或 MCTS；服务端仅使用 Qwen，需 QWEN_* 环境变量或显式 llm_mutator）。
+ * @param {"beam"|"mcts"} algorithm
  * @returns {Promise<object>} best_workflow
  */
-export async function optimizeWorkflowMcts({
+export async function optimizeWorkflow({
   base,
   workflow,
   prompt,
   evalDataset,
+  algorithm = "mcts",
   iterations = 12
 }) {
+  const algo = String(algorithm || "mcts").toLowerCase();
+  if (algo !== "beam" && algo !== "mcts") {
+    throw new Error('algorithm 须为 "beam" 或 "mcts"');
+  }
   const root = String(base || "").trim().replace(/\/$/, "");
+  const it = Math.max(1, Math.floor(Number(iterations) || 12));
+  const config =
+    algo === "beam"
+      ? {
+          algorithm: "beam",
+          iterations: it,
+          beam_width: 4,
+          candidates_per_parent: 4
+        }
+      : {
+          algorithm: "mcts",
+          iterations: it,
+          beam_width: 6,
+          candidates_per_parent: 4,
+          mcts_exploration: 1.2,
+          mcts_rollout_steps: 2
+        };
+
   const res = await fetch(`${root}/api/mwgl/optimize`, {
     method: "POST",
     headers: {
@@ -78,14 +102,7 @@ export async function optimizeWorkflowMcts({
       prompt: String(prompt || "").trim() || "MWGL 生成后优化",
       initial_workflow: workflow,
       eval_dataset: Array.isArray(evalDataset) ? evalDataset : [],
-      config: {
-        algorithm: "mcts",
-        iterations: Math.max(1, Math.floor(Number(iterations) || 12)),
-        beam_width: 6,
-        candidates_per_parent: 4,
-        mcts_exploration: 1.2,
-        mcts_rollout_steps: 2
-      },
+      config,
       evaluator: {
         url: `${root}/api/mwgl/mock-evaluator`,
         timeout_ms: 12000,
@@ -103,7 +120,11 @@ export async function optimizeWorkflowMcts({
   }
 
   if (!res.ok) {
-    throw new Error(data?.error || text.slice(0, 240));
+    const diag =
+      data?.diagnostics && typeof data.diagnostics === "object"
+        ? ` [诊断] ${JSON.stringify(data.diagnostics)}`
+        : "";
+    throw new Error((data?.error || text.slice(0, 240)) + diag);
   }
 
   const best = data?.best_workflow;
@@ -111,6 +132,11 @@ export async function optimizeWorkflowMcts({
     throw new Error("optimize 未返回 best_workflow");
   }
   return normalizeWorkflow(best);
+}
+
+/** @deprecated 使用 {@link optimizeWorkflow} 并传 algorithm: "mcts" */
+export async function optimizeWorkflowMcts(params) {
+  return optimizeWorkflow({ ...params, algorithm: "mcts" });
 }
 
 export async function pseudoToCode({ base, pseudocode, language }) {

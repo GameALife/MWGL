@@ -2,7 +2,7 @@ import {
   buildWorkflowByDeepSeek,
   dagToPseudocode,
   fetchEvalDataset,
-  optimizeWorkflowMcts,
+  optimizeWorkflow,
   pseudoToCode,
   runCodeQuickCheck
 } from "./api.js";
@@ -212,13 +212,19 @@ export function bindInteractions(elements, renderer) {
     persistSessions();
   }
 
-  const chkPostMctsEl = document.getElementById("chkPostMcts");
+  const selectPostOptimizeEl = document.getElementById("selectPostOptimize");
   const chkContextModeEl = document.getElementById("chkContextMode");
-  if (chkPostMctsEl) {
-    const saved = localStorage.getItem("mwgl_post_mcts");
-    if (saved !== null) chkPostMctsEl.checked = saved === "1";
-    chkPostMctsEl.addEventListener("change", () => {
-      localStorage.setItem("mwgl_post_mcts", chkPostMctsEl.checked ? "1" : "0");
+  if (selectPostOptimizeEl) {
+    let savedOpt = localStorage.getItem("mwgl_post_optimize");
+    if (savedOpt === null) {
+      const legacy = localStorage.getItem("mwgl_post_mcts");
+      savedOpt = legacy === "0" ? "none" : "mcts";
+    }
+    if (savedOpt === "none" || savedOpt === "beam" || savedOpt === "mcts") {
+      selectPostOptimizeEl.value = savedOpt;
+    }
+    selectPostOptimizeEl.addEventListener("change", () => {
+      localStorage.setItem("mwgl_post_optimize", selectPostOptimizeEl.value);
     });
   }
   if (chkContextModeEl) {
@@ -531,23 +537,27 @@ export function bindInteractions(elements, renderer) {
     try {
       let workflow = await buildWorkflowByDeepSeek({ base, prompt: effectivePrompt });
 
-      const chk = document.getElementById("chkPostMcts");
-      let mctsFail = "";
-      let mctsDone = false;
-      if (chk && chk.checked) {
-        setStatus("DeepSeek 已完成，正在进行 MCTS 优化（可能需十余秒）...");
+      const postOpt = selectPostOptimizeEl?.value || "none";
+      let optFail = "";
+      let optDone = false;
+      let optTail = "";
+      if (postOpt === "beam" || postOpt === "mcts") {
+        const label = postOpt === "beam" ? "束搜索" : "MCTS";
+        setStatus(`DeepSeek 已完成，正在进行 ${label} 优化（可能需十余秒）...`);
         try {
           const evalDataset = await fetchEvalDataset({ base });
-          workflow = await optimizeWorkflowMcts({
+          workflow = await optimizeWorkflow({
             base,
             workflow,
             prompt,
             evalDataset,
+            algorithm: postOpt,
             iterations: 12
           });
-          mctsDone = true;
+          optDone = true;
+          optTail = `（已做 ${label} 优化）`;
         } catch (optErr) {
-          mctsFail = ` MCTS 优化失败（已保留 DeepSeek 结果）：${optErr.message}`;
+          optFail = ` ${label} 优化失败（已保留 DeepSeek 结果）：${optErr.message}`;
         }
       }
 
@@ -560,12 +570,12 @@ export function bindInteractions(elements, renderer) {
       render();
       persistActiveSessionNow();
       const errs = constraintErrors(workflow);
-      const tail = mctsDone ? "（已做 MCTS 优化）" : chk && chk.checked && mctsFail ? "" : "";
+      const tail = optDone ? optTail : "";
       const msg =
         errs.length
           ? `已生成并渲染${tail}（草稿态，最终导出前请修复）：${formatConstraintErrors(errs)}`
           : `已生成 MWGL 并渲染到画布${tail}。`;
-      setStatus(mctsFail ? `${msg}${mctsFail}` : msg, Boolean(mctsFail));
+      setStatus(optFail ? `${msg}${optFail}` : msg, Boolean(optFail));
     } catch (error) {
       setStatus(`生成失败：${error.message}`, true);
     }

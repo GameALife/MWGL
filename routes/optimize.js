@@ -1,3 +1,4 @@
+import "../load-env.js";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -7,6 +8,9 @@ import { normalizeWorkflow, validateWorkflowConstraints } from "../js/mwgl.js";
 
 const router = Router();
 
+/** 优化路径仅允许 Qwen（DashScope 兼容 OpenAI）。不设 DeepSeek / 固定 DashScope URL 兜底；缺省项依赖 QWEN_*。 */
+const DEFAULT_QWEN_BASE = String(process.env.QWEN_BASE_URL || "").trim().replace(/\/$/, "");
+
 const DEFAULT_CONFIG = {
   algorithm: "beam",
   iterations: 12,
@@ -14,9 +18,16 @@ const DEFAULT_CONFIG = {
   candidates_per_parent: 4,
   mcts_exploration: 1.2,
   mcts_rollout_steps: 2,
+  /** 仅 MCTS：为 true 时在首层对每个种子枚举全部内置算子邻域（整图校验通过才挂枝），得到多条并列第一步 */
+  mcts_seed_expand_all_operators: false,
   eval_topk: 24,
   retrieval_mode: "faiss",
   max_nodes: 40,
+  /** operator_select：仅从代码预生成的合法邻图中选名；llm_generate：小模型直接产出整张合法 MWGL（可一步内配套多改） */
+  mutation_mode: "operator_select",
+  llm_generate_max_retries: 3,
+  /** 为 true 时才调用 llm_scorer；默认 false，仅用本地启发式 + 可选 HTTP evaluator */
+  enable_llm_scorer: false,
   weights: {
     task_success: 1.0,
     cost: 0.15,
@@ -31,13 +42,37 @@ const DEFAULT_EVALUATOR = {
 };
 const DEFAULT_LLM_MUTATOR = {
   url: "",
-  base_url: process.env.QWEN_BASE_URL || process.env.DEEPSEEK_API_BASE || "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  base_url: DEFAULT_QWEN_BASE,
   timeout_ms: 8000,
   pass_through_prompt: true,
   mutation_ratio: 0.85,
-  model: process.env.QWEN_MODEL || process.env.DEEPSEEK_MODEL || "deepseek-chat",
+  model: process.env.QWEN_MODEL || "qwen-turbo",
   temperature: 0.2,
   max_tokens: 800,
+  api_key: ""
+};
+
+/** 扩展 / rollout 生成式变异专用（默认可与 mutator 同源；可用更小模型降本） */
+const DEFAULT_LLM_EXPAND = {
+  url: "",
+  base_url: DEFAULT_QWEN_BASE,
+  timeout_ms: 12000,
+  pass_through_prompt: true,
+  model: process.env.MWGL_EXPAND_MODEL || process.env.QWEN_MODEL || "qwen-turbo",
+  temperature: 0.35,
+  max_tokens: 4096,
+  api_key: ""
+};
+
+/** 可选：由模型输出综合分（无 HTTP evaluator 或与本地混合参考） */
+const DEFAULT_LLM_SCORER = {
+  url: "",
+  base_url: DEFAULT_QWEN_BASE,
+  timeout_ms: 8000,
+  pass_through_prompt: true,
+  model: process.env.MWGL_SCORER_MODEL || process.env.QWEN_MODEL || "qwen-turbo",
+  temperature: 0.1,
+  max_tokens: 512,
   api_key: ""
 };
 
@@ -66,9 +101,20 @@ function mergeConfig(input) {
   cfg.candidates_per_parent = clamp(Math.floor(safeNumber(source.candidates_per_parent, cfg.candidates_per_parent)), 1, 20);
   cfg.mcts_exploration = clamp(safeNumber(source.mcts_exploration, cfg.mcts_exploration), 0.05, 5);
   cfg.mcts_rollout_steps = clamp(Math.floor(safeNumber(source.mcts_rollout_steps, cfg.mcts_rollout_steps)), 1, 6);
+  cfg.mcts_seed_expand_all_operators = Boolean(source.mcts_seed_expand_all_operators);
   cfg.eval_topk = clamp(Math.floor(safeNumber(source.eval_topk, cfg.eval_topk)), 0, 200);
   cfg.retrieval_mode = String(source.retrieval_mode || cfg.retrieval_mode).trim().toLowerCase() === "faiss" ? "faiss" : "token";
   cfg.max_nodes = clamp(Math.floor(safeNumber(source.max_nodes, cfg.max_nodes)), 4, 500);
+  const mm = String(source.mutation_mode || cfg.mutation_mode || "")
+    .trim()
+    .toLowerCase();
+  cfg.mutation_mode = mm === "llm_generate" ? "llm_generate" : "operator_select";
+  cfg.llm_generate_max_retries = clamp(
+    Math.floor(safeNumber(source.llm_generate_max_retries, cfg.llm_generate_max_retries)),
+    1,
+    8
+  );
+  cfg.enable_llm_scorer = source.enable_llm_scorer === true;
   cfg.weights.task_success = safeNumber(source.weights?.task_success, cfg.weights.task_success);
   cfg.weights.cost = safeNumber(source.weights?.cost, cfg.weights.cost);
   cfg.weights.latency = safeNumber(source.weights?.latency, cfg.weights.latency);
@@ -94,10 +140,45 @@ function mergeLlmMutatorConfig(input) {
   cfg.timeout_ms = clamp(Math.floor(safeNumber(source.timeout_ms, cfg.timeout_ms)), 300, 60000);
   cfg.pass_through_prompt = source.pass_through_prompt !== false;
   cfg.mutation_ratio = clamp(safeNumber(source.mutation_ratio, cfg.mutation_ratio), 0, 1);
-  cfg.model = String(source.model || "").trim();
+  cfg.model = String(source.model || cfg.model || "").trim();
+  if (!cfg.model) {
+    cfg.model = process.env.QWEN_MODEL || DEFAULT_LLM_MUTATOR.model || "qwen-turbo";
+  }
   cfg.temperature = clamp(safeNumber(source.temperature, cfg.temperature), 0, 2);
   cfg.max_tokens = clamp(Math.floor(safeNumber(source.max_tokens, cfg.max_tokens)), 64, 8192);
-  cfg.api_key = String(source.api_key || process.env.QWEN_API_KEY || process.env.DEEPSEEK_API_KEY || "").trim();
+  cfg.api_key = String(source.api_key || process.env.QWEN_API_KEY || "").trim();
+  cfg.headers = source.headers && typeof source.headers === "object" ? source.headers : {};
+  return cfg;
+}
+
+function mergeLlmExpandConfig(input) {
+  const cfg = deepClone(DEFAULT_LLM_EXPAND);
+  const source = input && typeof input === "object" ? input : {};
+  cfg.url = String(source.url || "").trim();
+  cfg.base_url = String(source.base_url || cfg.base_url).trim();
+  cfg.timeout_ms = clamp(Math.floor(safeNumber(source.timeout_ms, cfg.timeout_ms)), 300, 120000);
+  cfg.pass_through_prompt = source.pass_through_prompt !== false;
+  cfg.model = String(source.model || cfg.model || "").trim();
+  if (!cfg.model) cfg.model = DEFAULT_LLM_EXPAND.model;
+  cfg.temperature = clamp(safeNumber(source.temperature, cfg.temperature), 0, 2);
+  cfg.max_tokens = clamp(Math.floor(safeNumber(source.max_tokens, cfg.max_tokens)), 256, 8192);
+  cfg.api_key = String(source.api_key || process.env.QWEN_API_KEY || "").trim();
+  cfg.headers = source.headers && typeof source.headers === "object" ? source.headers : {};
+  return cfg;
+}
+
+function mergeLlmScorerConfig(input) {
+  const cfg = deepClone(DEFAULT_LLM_SCORER);
+  const source = input && typeof input === "object" ? input : {};
+  cfg.url = String(source.url || "").trim();
+  cfg.base_url = String(source.base_url || cfg.base_url).trim();
+  cfg.timeout_ms = clamp(Math.floor(safeNumber(source.timeout_ms, cfg.timeout_ms)), 300, 60000);
+  cfg.pass_through_prompt = source.pass_through_prompt !== false;
+  cfg.model = String(source.model || cfg.model || "").trim();
+  if (!cfg.model) cfg.model = DEFAULT_LLM_SCORER.model;
+  cfg.temperature = clamp(safeNumber(source.temperature, cfg.temperature), 0, 2);
+  cfg.max_tokens = clamp(Math.floor(safeNumber(source.max_tokens, cfg.max_tokens)), 64, 2048);
+  cfg.api_key = String(source.api_key || process.env.QWEN_API_KEY || "").trim();
   cfg.headers = source.headers && typeof source.headers === "object" ? source.headers : {};
   return cfg;
 }
@@ -480,6 +561,336 @@ const OPERATORS = [
   opRenameTextForSemantics
 ];
 
+/** 与内置算子 id 一致，供生成模型作「意图白名单」提示；无前置可用算子时退回全集 */
+const OPERATOR_HINT_IDS = [
+  "add_switch_after_node",
+  "change_edge_label",
+  "insert_retry_loop",
+  "parallelize_cases",
+  "merge_parallel_branches",
+  "add_failure_path",
+  "prune_redundant_case",
+  "rename_text_for_semantics"
+];
+
+/** 供 user 消息算子字段释义（与代码内置 OPERATORS 一致） */
+const OPERATOR_SEMANTICS_ZH = {
+  add_switch_after_node: "在合适节点后插入 switch，用出边 label 承载互斥条件",
+  change_edge_label: "修改边 label，常用于细化 switch 分支条件或其它转移语义",
+  insert_retry_loop: "在 case 类节点后插入重试循环（loop_start→loop_end 结构）",
+  parallelize_cases: "将若干并列 case 改为 parallel 并行语义",
+  merge_parallel_branches: "合并并行分支的汇聚结构",
+  add_failure_path: "补充 failure 终态路径，明确非成功业务结局",
+  prune_redundant_case: "删除或合并冗余 case 节点/边",
+  rename_text_for_semantics: "调整节点 text，使业务语义可读（须符合 failure 等非泛化文案要求）"
+};
+
+/**
+ * 与 `validateWorkflowConstraints` + normalize 行为对齐的合法改写要点（小模型须按此自检）。
+ * normalize 会过滤部分非法边以保持 DAG，仍应尽量一次性产出可通过校验的图。
+ */
+const MWGL_V2_HARD_RULES_ZH = [
+  "【结构】全图为有向无环图（DAG）：禁止自环；边的 from/to 必须引用已存在节点 id；success/failure 禁止任何出边。",
+  "【入口】必须且仅能有一个 start；start 无入边；start 至少一条出边。",
+  "【终态】至少存在一个从 start 可达的 success 或 failure；从 start 可达的每个非终态节点都必须能到达某个终态（无执行死路）。",
+  "【分支】switch 至少一条出边；每条出边 label 非空、在同一 switch 下不重复；label 须为可判定业务语义（禁止纯数字、禁止「分支N」类占位）。",
+  "【并行】parallel 至少两条出边。",
+  "【循环】loop_start 有且仅有 1 条出边（进入循环体）；从该 loop_start 沿边必须能到达某个 loop_end；loop_end 至少一条出边；每个 loop_end 须能从某个 loop_start 到达（成对）。",
+  "【动作】case、wait_user 每个节点最多一条出边。",
+  "【失败节点】failure 的 text 不得为泛化词（如单独「失败」「failure」）；须写明具体失败语义（如任务未达成-超时、失败结局-生命值归零）。可选 failure_kind：game_lose | goal_not_met | precondition_not_met | risk_blocked。",
+  "【规模】节点数不得超过用户给出的 max_nodes。"
+].join("\n");
+
+/** operator_select：小模型仅从预生成合法邻域中选名 */
+const OPERATOR_SELECT_SYSTEM_ZH = [
+  "你是 MWGL 变异算子选择器。用户消息为 JSON：含 workflow、available_operators（字符串 id 列表）、prompt、max_nodes 等。",
+  "你必须且只能从 available_operators 中选择一个算子 id 执行改写；不得发明新 id。若当前列表均无法安全改进优化目标，则拒绝。",
+  "只输出一个 JSON 对象，两种形态之一：",
+  '{"decision":"choose","op":"<须等于列表中某项>"} 或 {"decision":"reject","reason":"<简短原因>"}。',
+  "禁止 markdown、禁止代码围栏、禁止 JSON 以外的文字。"
+].join("\n");
+
+function listRelevantOperatorHints(parentWorkflow, maxNodes) {
+  const hints = [];
+  for (const opFn of OPERATORS) {
+    const candidate = opFn(parentWorkflow);
+    if (!candidate) continue;
+    if ((candidate.workflow.nodes || []).length > maxNodes) continue;
+    hints.push(candidate.op);
+  }
+  return hints;
+}
+
+const LLM_GENERATE_SYSTEM = [
+  "你是 MWGL v2 工作流「合法改写」专用小模型。用户消息为 JSON：含 phase（generate 或 repair）、prompt、workflow、max_nodes、relevant_operators；repair 时另有 previous_json、validation_errors。",
+  "",
+  "【任务】output 必须是替换后的**完整**工作流对象（整图替换，不是 patch）。可在一步内做多处配套修改（如同时调整 switch 分支与边标签）。phase=repair 时：必须在语义保持的前提下**逐项消除** validation_errors 中的全部校验错误后再输出。",
+  "",
+  "【输出契约 — 违反即视为失败】",
+  "- 你的回复中**有效内容仅为一个 JSON 对象**（表示 MWGL v2 工作流），首字符为「{」，末字符为「}」。",
+  "- **禁止** markdown、**禁止** ``` 代码围栏、**禁止** JSON 前后的说明/标题/注释/「以下是」等任何额外文本。",
+  "- **禁止** 外层再包一层：顶层字段必须是 mwgl_version、rule_id、rule_name、nodes、edges（勿仅用 workflow 键包裹内层对象）。",
+  "",
+  MWGL_V2_HARD_RULES_ZH,
+  "",
+  "【字段形状】顶层：mwgl_version（数字 2）、rule_id、rule_name、nodes、edges。nodes[]：id,type,text,x,y（数值坐标）；type=failure 时可含 failure_kind。edges[]：id,from,to,label（字符串）。type 枚举：start,wait_user,switch,loop_start,loop_end,parallel,case,success,failure。",
+  "",
+  "【relevant_operators / operator_hints】用户 JSON 中含 relevant_operators（id 列表）及 operator_hints（id+中文释义）；与业务 prompt 冲突时以可通过服务端校验（与实现 validateWorkflowConstraints 一致）为准。",
+  "",
+  "【自检】输出前在内心核对上述硬性规则；repair 阶段须对照 validation_errors 直到校验可通过。"
+].join("\n");
+
+function stripMarkdownFence(text) {
+  return String(text || "")
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+}
+
+function validateWorkflowJsonText(raw) {
+  try {
+    const parsed = JSON.parse(stripMarkdownFence(raw));
+    const normalized = normalizeWorkflow(parsed);
+    const result = validateWorkflowConstraints(normalized);
+    return { ok: result.ok, errors: result.errors || [], normalized };
+  } catch (error) {
+    return {
+      ok: false,
+      errors: [`JSON 解析或结构错误：${error.message}`],
+      normalized: null
+    };
+  }
+}
+
+function resolveExpandClient(context) {
+  const ex = context?.llmExpand;
+  if (ex?.url || (ex?.base_url && ex?.api_key && ex?.model)) return ex;
+  const m = context?.llmMutator;
+  if (m?.url || (m?.base_url && m?.api_key && m?.model)) return m;
+  return null;
+}
+
+function llmClientEnabled(client) {
+  return Boolean(client?.url || (client?.base_url && client?.api_key && client?.model));
+}
+
+/** 请求未带完整客户端字段时，仅用 QWEN_* 补全（无 DeepSeek / 无固定 URL 兜底） */
+function mergeQwenFromEnvDefaults(client) {
+  if (llmClientEnabled(client)) return client;
+  const apiKey = process.env.QWEN_API_KEY || "";
+  if (!String(apiKey).trim()) return client;
+  const baseRaw =
+    (client.base_url && String(client.base_url).trim()) || process.env.QWEN_BASE_URL || "";
+  const modelRaw =
+    (client.model && String(client.model).trim()) || process.env.QWEN_MODEL || "qwen-turbo";
+  return {
+    ...client,
+    api_key: (client.api_key && String(client.api_key).trim()) || String(apiKey).trim(),
+    base_url: String(baseRaw || "").replace(/\/$/, ""),
+    model: String(modelRaw || "").trim() || "qwen-turbo"
+  };
+}
+
+/** 合并后再强制铺齐 api_key / base_url / model，仅来源 QWEN_* 或请求体显式字段 */
+function finalizeQwenCredentials(client) {
+  const apiKey = String(client.api_key || process.env.QWEN_API_KEY || "").trim();
+  const baseUrl = String(client.base_url || process.env.QWEN_BASE_URL || "").trim().replace(/\/$/, "");
+  const model = String(client.model || process.env.QWEN_MODEL || "qwen-turbo").trim();
+  return {
+    ...client,
+    api_key: apiKey,
+    base_url: baseUrl,
+    model
+  };
+}
+
+/** 禁止优化链路指向 DeepSeek（环境兜底已关闭，请求体亦不允许） */
+function endpointLooksLikeDeepSeek(urlStr) {
+  return String(urlStr || "")
+    .toLowerCase()
+    .includes("deepseek");
+}
+
+function mutatorDiagnostics(llmMutator) {
+  const url = Boolean(llmMutator?.url && String(llmMutator.url).trim());
+  const base = Boolean(llmMutator?.base_url && String(llmMutator.base_url).trim());
+  const key = Boolean(llmMutator?.api_key && String(llmMutator.api_key).trim());
+  const model = Boolean(llmMutator?.model && String(llmMutator.model).trim());
+  const envHint = {
+    has_QWEN_API_KEY: Boolean(process.env.QWEN_API_KEY && String(process.env.QWEN_API_KEY).trim()),
+    has_QWEN_BASE_URL: Boolean(process.env.QWEN_BASE_URL && String(process.env.QWEN_BASE_URL).trim()),
+    has_QWEN_MODEL: Boolean(process.env.QWEN_MODEL && String(process.env.QWEN_MODEL).trim())
+  };
+  return { url, base_url: base, api_key: key, model, envHint };
+}
+
+async function postChatCompletion(clientCfg, messages, options = {}) {
+  const { jsonObject = false } = options;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), clientCfg.timeout_ms);
+  const apiUrl = `${String(clientCfg.base_url || "").replace(/\/$/, "")}/chat/completions`;
+  try {
+    const body = {
+      model: clientCfg.model,
+      temperature: clientCfg.temperature,
+      max_tokens: clientCfg.max_tokens,
+      messages,
+      ...(jsonObject ? { response_format: { type: "json_object" } } : {})
+    };
+    const response = await fetch(apiUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${clientCfg.api_key}`,
+        ...clientCfg.headers
+      },
+      signal: ctrl.signal,
+      body: JSON.stringify(body)
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      throw new Error(`Qwen chat/completions：HTTP ${response.status} ${text.slice(0, 520)}`);
+    }
+    let payload;
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      throw new Error(`Qwen chat/completions：响应非 JSON ${text.slice(0, 360)}`);
+    }
+    const content = payload?.choices?.[0]?.message?.content;
+    if (typeof content !== "string") {
+      throw new Error(`Qwen chat/completions：缺少 choices[0].message.content ${text.slice(0, 360)}`);
+    }
+    return content;
+  } catch (e) {
+    if (e instanceof Error && e.message.startsWith("Qwen chat/completions")) throw e;
+    const hint = e?.name === "AbortError" ? "请求超时（Abort）" : e?.message || String(e);
+    throw new Error(`Qwen chat/completions：${hint}`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function buildGenerateUserPayload(context, expandCfg, parentWorkflow, maxNodes, relevantHints, phase, repair) {
+  const ops = relevantHints.length > 0 ? relevantHints : OPERATOR_HINT_IDS;
+  const base = {
+    phase,
+    prompt: clientCfgPassPrompt(context, expandCfg),
+    workflow: parentWorkflow,
+    max_nodes: maxNodes,
+    relevant_operators: ops,
+    operator_hints: ops.map((id) => ({
+      id,
+      purpose_zh: OPERATOR_SEMANTICS_ZH[id] || ""
+    })),
+    output_requirement_zh:
+      "模型回复正文只能是单个 MWGL v2 工作流 JSON 对象（mwgl_version,nodes,edges 等），禁止 markdown、禁止代码围栏、禁止任何额外说明。",
+    validation_implies:
+      "服务端使用与本仓库 mwgl-v2.js 中 validateWorkflowConstraints 相同的规则校验你的输出；repair 阶段必须消除列出的全部 validation_errors。"
+  };
+  if (phase === "repair" && repair) {
+    base.previous_json = repair.previousJson;
+    base.validation_errors = repair.errorsText;
+    if (repair.instruction) base.instruction = repair.instruction;
+  }
+  return JSON.stringify(base);
+}
+
+function clientCfgPassPrompt(context, expandCfg) {
+  const pass = expandCfg?.pass_through_prompt !== false;
+  return pass ? String(context?.prompt || "").trim() : "";
+}
+
+async function mutateWorkflowViaLlmGenerate(parentWorkflow, maxNodes, context) {
+  let expandCfg = resolveExpandClient(context);
+  if (!expandCfg || !llmClientEnabled(expandCfg)) return null;
+  if (safeNumber(expandCfg.max_tokens, 0) < 2048) {
+    expandCfg = { ...expandCfg, max_tokens: Math.min(8192, 2048) };
+  }
+
+  let relevantHints = listRelevantOperatorHints(parentWorkflow, maxNodes);
+  if (relevantHints.length === 0) relevantHints = [...OPERATOR_HINT_IDS];
+
+  const maxRounds = clamp(
+    Math.floor(safeNumber(context?.llmGenerateMaxRetries, 3)),
+    1,
+    8
+  );
+
+  async function runOnce(userBodyStr) {
+    if (expandCfg.url) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), expandCfg.timeout_ms);
+      try {
+        const response = await fetch(expandCfg.url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...expandCfg.headers
+          },
+          signal: ctrl.signal,
+          body: userBodyStr
+        });
+        const rawText = await response.text();
+        if (!response.ok) {
+          throw new Error(`llm_expand.url：HTTP ${response.status} ${rawText.slice(0, 520)}`);
+        }
+        let payload;
+        try {
+          payload = JSON.parse(rawText);
+        } catch {
+          throw new Error(`llm_expand.url：响应非 JSON ${rawText.slice(0, 360)}`);
+        }
+        if (typeof payload?.content === "string") return payload.content;
+        if (typeof payload?.workflow === "object") return JSON.stringify(payload.workflow);
+        throw new Error(`llm_expand.url：期望 content 字符串或 workflow 对象`);
+      } catch (e) {
+        if (e instanceof Error && e.message.startsWith("llm_expand.url")) throw e;
+        throw new Error(`llm_expand.url：${e?.message || String(e)}`);
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    const messages = [
+      { role: "system", content: LLM_GENERATE_SYSTEM },
+      {
+        role: "user",
+        content: userBodyStr
+      }
+    ];
+    return postChatCompletion(expandCfg, messages, { jsonObject: true });
+  }
+
+  let userContent = buildGenerateUserPayload(
+    context,
+    expandCfg,
+    parentWorkflow,
+    maxNodes,
+    relevantHints,
+    "generate",
+    null
+  );
+  let raw = await runOnce(userContent);
+  let checked = raw ? validateWorkflowJsonText(raw) : { ok: false, errors: ["empty_response"], normalized: null };
+
+  for (let round = 1; round < maxRounds && !checked.ok; round += 1) {
+    const errLines = (checked.errors || []).map((e, i) => `${i + 1}) ${e}`).join("\n");
+    const repairBody = buildGenerateUserPayload(context, expandCfg, parentWorkflow, maxNodes, relevantHints, "repair", {
+      previousJson: stripMarkdownFence(raw || "{}"),
+      errorsText: errLines,
+      instruction: `第 ${round + 1}/${maxRounds} 次修复。必须逐项消除本请求中的 validation_errors；输出仍为完整工作流 JSON，且回复正文只能包含该 JSON（无 markdown、无解释）。`
+    });
+    raw = await runOnce(repairBody);
+    checked = raw ? validateWorkflowJsonText(raw) : { ok: false, errors: ["empty_response"], normalized: null };
+  }
+
+  if (!checked.ok || !checked.normalized) return null;
+  if ((checked.normalized.nodes || []).length > maxNodes) return null;
+  return { workflow: checked.normalized, op: "llm_generate" };
+}
+
+/** 仅按「能不能执行这条算子」与节点上限筛选；不做整图硬校验（校验留在 beam/MCTS 扩展阶段） */
 function listValidOperatorChoices(parentWorkflow, maxNodes) {
   const validChoices = [];
   for (const opFn of OPERATORS) {
@@ -487,14 +898,30 @@ function listValidOperatorChoices(parentWorkflow, maxNodes) {
     if (!candidate) continue;
     if ((candidate.workflow.nodes || []).length > maxNodes) continue;
     const normalized = normalizeWorkflow(candidate.workflow);
-    const check = validateWorkflowConstraints(normalized);
-    if (!check.ok) continue;
     validChoices.push({
       op: candidate.op,
       workflow: normalized
     });
   }
   return validChoices;
+}
+
+/** MCTS 种子层并列分枝：八种算子各试一遍，仅保留通过整图校验且不重复的邻图 */
+function listAllValidatedOperatorBranches(parentWorkflow, maxNodes) {
+  const out = [];
+  for (const opFn of OPERATORS) {
+    const candidate = opFn(parentWorkflow);
+    if (!candidate) continue;
+    if ((candidate.workflow.nodes || []).length > maxNodes) continue;
+    const normalized = normalizeWorkflow(candidate.workflow);
+    const check = validateWorkflowConstraints(normalized);
+    if (!check.ok) continue;
+    out.push({
+      op: candidate.op,
+      workflow: normalized
+    });
+  }
+  return out;
 }
 
 async function mutateWorkflowViaLlm(parentWorkflow, maxNodes, context) {
@@ -528,7 +955,7 @@ async function mutateWorkflowViaLlm(parentWorkflow, maxNodes, context) {
           temperature: llmMutator.temperature,
           max_tokens: llmMutator.max_tokens,
           hint:
-            "Return strict JSON only: {'decision':'choose','op':'<one_of_available_operators>'} or {'decision':'reject','reason':'...'}."
+            "仅输出 JSON：{\"decision\":\"choose\",\"op\":\"<available_operators 中之一>\"} 或 {\"decision\":\"reject\",\"reason\":\"...\"}；禁止其它文字。"
         })
       });
     } else {
@@ -549,8 +976,7 @@ async function mutateWorkflowViaLlm(parentWorkflow, maxNodes, context) {
           messages: [
             {
               role: "system",
-              content:
-                "You are an MWGL mutation operator selector. You must select exactly one operator from available_operators, or reject when none can safely improve. Return strict JSON only: {'decision':'choose','op':'...'} or {'decision':'reject','reason':'...'}."
+              content: OPERATOR_SELECT_SYSTEM_ZH
             },
             {
               role: "user",
@@ -558,22 +984,37 @@ async function mutateWorkflowViaLlm(parentWorkflow, maxNodes, context) {
                 prompt: llmMutator.pass_through_prompt ? context?.prompt || "" : "",
                 workflow: parentWorkflow,
                 max_nodes: maxNodes,
-                available_operators: availableOps
+                available_operators: availableOps,
+                operator_meanings: availableOps.map((id) => ({
+                  id,
+                  purpose_zh: OPERATOR_SEMANTICS_ZH[id] || ""
+                })),
+                output_requirement_zh: "仅输出一个 JSON 对象，禁止 markdown 与任何附加说明。"
               })
             }
           ]
         })
       });
     }
-    if (!response.ok) return null;
-    let payload = await response.json();
+    const rawText = await response.text();
+    if (!response.ok) {
+      throw new Error(`Qwen chat/completions（operator_select）：HTTP ${response.status} ${rawText.slice(0, 520)}`);
+    }
+    let payload;
+    try {
+      payload = JSON.parse(rawText);
+    } catch {
+      throw new Error(`Qwen chat/completions（operator_select）：响应非 JSON ${rawText.slice(0, 360)}`);
+    }
     if (!llmMutator.url) {
       const content = payload?.choices?.[0]?.message?.content;
-      if (!content) return null;
+      if (!content) {
+        throw new Error(`Qwen chat/completions（operator_select）：缺少 message.content ${rawText.slice(0, 360)}`);
+      }
       try {
         payload = JSON.parse(content);
-      } catch (_e) {
-        return null;
+      } catch (e) {
+        throw new Error(`Qwen chat/completions（operator_select）：content 非合法 JSON：${e.message || String(e)}`);
       }
     }
     const decision = String(payload?.decision || "").trim().toLowerCase();
@@ -584,21 +1025,28 @@ async function mutateWorkflowViaLlm(parentWorkflow, maxNodes, context) {
     const picked = validChoiceByOp.get(opName);
     if (!picked) return null;
     return { workflow: picked.workflow, op: picked.op };
-  } catch (_error) {
-    return null;
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("Qwen chat/completions")) throw error;
+    throw new Error(`Qwen chat/completions（operator_select）：${error?.message || String(error)}`);
   } finally {
     if (timer) clearTimeout(timer);
   }
 }
 
 async function mutateWorkflow(parentWorkflow, maxNodes, context) {
-  const llmMutator = context?.llmMutator;
-  const hasLlmEndpoint = Boolean(
-    llmMutator?.url || (llmMutator?.base_url && llmMutator?.api_key && llmMutator?.model)
-  );
-  if (!hasLlmEndpoint) {
-    return null;
+  const mode = context?.mutationMode || "operator_select";
+  const mutator = context?.llmMutator;
+  const hasMutator = llmClientEnabled(mutator);
+  const expandResolved = resolveExpandClient(context);
+  const hasExpandClient = llmClientEnabled(expandResolved);
+
+  if (mode === "llm_generate") {
+    if (!hasExpandClient && !hasMutator) return null;
+    const generated = await mutateWorkflowViaLlmGenerate(parentWorkflow, maxNodes, context);
+    return generated || null;
   }
+
+  if (!hasMutator) return null;
   const llmCandidate = await mutateWorkflowViaLlm(parentWorkflow, maxNodes, context);
   if (llmCandidate && !llmCandidate.rejected) return llmCandidate;
   return null;
@@ -610,60 +1058,149 @@ function computeLocalEvaluation(workflow, evalDataset, configWeights) {
   return { workflow, metrics, score };
 }
 
+async function scoreViaLlm(local, workflow, evalDataset, context) {
+  const scorer = context?.llmScorer;
+  if (!scorer || !llmClientEnabled(scorer)) return null;
+
+  const payloadObj = {
+    prompt: clientCfgPassPrompt(context, scorer),
+    workflow,
+    eval_dataset: evalDataset,
+    local_metrics: local.metrics,
+    local_score: local.score
+  };
+
+  const systemContent = [
+    "你是 MWGL 工作流优化评测小模型。依据 workflow、eval_dataset 条目、local_metrics 与 local_score 给出单一综合分。",
+    "只输出一个 JSON 对象，且仅含键 score（数字）：例如 {\"score\":0.75}。禁止 markdown、禁止解释、禁止除该 JSON 外的任何文字。"
+  ].join("");
+
+  if (scorer.url) {
+    let timer = null;
+    try {
+      const ctrl = new AbortController();
+      timer = setTimeout(() => ctrl.abort(), scorer.timeout_ms);
+      const response = await fetch(scorer.url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...scorer.headers
+        },
+        signal: ctrl.signal,
+        body: JSON.stringify(payloadObj)
+      });
+      const rawText = await response.text();
+      if (!response.ok) {
+        throw new Error(`llm_scorer.url：HTTP ${response.status} ${rawText.slice(0, 520)}`);
+      }
+      let payload;
+      try {
+        payload = JSON.parse(rawText);
+      } catch {
+        throw new Error(`llm_scorer.url：响应非 JSON ${rawText.slice(0, 360)}`);
+      }
+      const remoteScore = Number(payload?.score);
+      if (!Number.isFinite(remoteScore)) {
+        throw new Error(`llm_scorer.url：缺少合法 score 字段`);
+      }
+      return {
+        workflow,
+        metrics: local.metrics,
+        score: remoteScore,
+        source: "llm_scorer"
+      };
+    } catch (e) {
+      if (e instanceof Error && e.message.startsWith("llm_scorer.url")) throw e;
+      throw new Error(`llm_scorer.url：${e?.message || String(e)}`);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  const content = await postChatCompletion(
+    scorer,
+    [
+      { role: "system", content: systemContent },
+      { role: "user", content: JSON.stringify(payloadObj) }
+    ],
+    { jsonObject: true }
+  );
+  if (!content) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(stripMarkdownFence(content));
+  } catch (_e) {
+    return null;
+  }
+  const remoteScore = Number(parsed?.score);
+  if (!Number.isFinite(remoteScore)) return null;
+  return {
+    workflow,
+    metrics: local.metrics,
+    score: remoteScore,
+    source: "llm_scorer"
+  };
+}
+
 async function evaluateCandidate(workflow, evalDataset, configWeights, context) {
   const local = computeLocalEvaluation(workflow, evalDataset, configWeights);
   const evaluator = context?.evaluator;
-  if (!evaluator?.url) {
-    return { ...local, source: "local" };
+  if (evaluator?.url) {
+    let timer = null;
+    try {
+      const ctrl = new AbortController();
+      timer = setTimeout(() => ctrl.abort(), evaluator.timeout_ms);
+      const response = await fetch(evaluator.url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...evaluator.headers
+        },
+        signal: ctrl.signal,
+        body: JSON.stringify({
+          prompt: evaluator.pass_through_prompt ? context?.prompt || "" : "",
+          workflow,
+          eval_dataset: evalDataset,
+          local_metrics: local.metrics,
+          local_score: local.score
+        })
+      });
+      if (!response.ok) {
+        return { ...local, source: "local_fallback_http_error" };
+      }
+      const payload = await response.json();
+      const remoteScore = Number(payload?.score);
+      if (!Number.isFinite(remoteScore)) {
+        return { ...local, source: "local_fallback_invalid_remote_score" };
+      }
+      const remoteMetrics =
+        payload?.metrics && typeof payload.metrics === "object"
+          ? {
+              task_success: safeNumber(payload.metrics.task_success, local.metrics.task_success),
+              cost: clamp(safeNumber(payload.metrics.cost, local.metrics.cost), 0, 1),
+              latency: clamp(safeNumber(payload.metrics.latency, local.metrics.latency), 0, 1),
+              complexity: clamp(safeNumber(payload.metrics.complexity, local.metrics.complexity), 0, 1)
+            }
+          : local.metrics;
+      return {
+        workflow,
+        metrics: remoteMetrics,
+        score: remoteScore,
+        source: "remote"
+      };
+    } catch (_error) {
+      return { ...local, source: "local_fallback_exception" };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
-  let timer = null;
-  try {
-    const ctrl = new AbortController();
-    timer = setTimeout(() => ctrl.abort(), evaluator.timeout_ms);
-    const response = await fetch(evaluator.url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...evaluator.headers
-      },
-      signal: ctrl.signal,
-      body: JSON.stringify({
-        prompt: evaluator.pass_through_prompt ? context?.prompt || "" : "",
-        workflow,
-        eval_dataset: evalDataset,
-        local_metrics: local.metrics,
-        local_score: local.score
-      })
-    });
-    if (!response.ok) {
-      return { ...local, source: "local_fallback_http_error" };
-    }
-    const payload = await response.json();
-    const remoteScore = Number(payload?.score);
-    if (!Number.isFinite(remoteScore)) {
-      return { ...local, source: "local_fallback_invalid_remote_score" };
-    }
-    const remoteMetrics =
-      payload?.metrics && typeof payload.metrics === "object"
-        ? {
-            task_success: safeNumber(payload.metrics.task_success, local.metrics.task_success),
-            cost: clamp(safeNumber(payload.metrics.cost, local.metrics.cost), 0, 1),
-            latency: clamp(safeNumber(payload.metrics.latency, local.metrics.latency), 0, 1),
-            complexity: clamp(safeNumber(payload.metrics.complexity, local.metrics.complexity), 0, 1)
-          }
-        : local.metrics;
-    return {
-      workflow,
-      metrics: remoteMetrics,
-      score: remoteScore,
-      source: "remote"
-    };
-  } catch (_error) {
-    return { ...local, source: "local_fallback_exception" };
-  } finally {
-    if (timer) clearTimeout(timer);
+  if (context?.enable_llmScorer === true) {
+    const llmJudged = await scoreViaLlm(local, workflow, evalDataset, context);
+    if (llmJudged) return llmJudged;
   }
+
+  return { ...local, source: "local" };
 }
 
 function dedupeBySignature(candidates) {
@@ -792,6 +1329,44 @@ async function runMctsSearch(seedCandidates, evalDataset, config, context) {
     };
     root.children.push(child);
     nodesBySignature.set(signature, child);
+  }
+
+  if (config.mcts_seed_expand_all_operators) {
+    for (const seedNode of root.children) {
+      const branches = listAllValidatedOperatorBranches(seedNode.workflow, config.max_nodes);
+      for (const br of branches) {
+        const sig = workflowSignature(br.workflow);
+        if (nodesBySignature.has(sig)) continue;
+        nodeCounter += 1;
+        const judged = await evaluateCandidate(br.workflow, evalDataset, config.weights, context);
+        const branchNode = {
+          id: `mcts_seed_br_${nodeCounter}`,
+          workflow: br.workflow,
+          metrics: judged.metrics,
+          score: judged.score,
+          rewardSum: 0,
+          visits: 0,
+          op: br.op,
+          parent: seedNode,
+          children: [],
+          triedOps: new Set(),
+          source: judged.source
+        };
+        nodesBySignature.set(sig, branchNode);
+        seedNode.children.push(branchNode);
+        keptMutations.add(br.op);
+        if (judged.score > best.score) {
+          best = {
+            workflow: br.workflow,
+            metrics: judged.metrics,
+            score: judged.score,
+            source: judged.source,
+            id: branchNode.id,
+            op: br.op
+          };
+        }
+      }
+    }
   }
 
   function uctValue(parent, child) {
@@ -948,16 +1523,58 @@ router.post("/api/mwgl/optimize", async (req, res) => {
     const rawEvalDataset = Array.isArray(req.body?.eval_dataset) ? req.body.eval_dataset : [];
     const evalDataset = selectRelevantEvalDataset(rawEvalDataset, prompt, config);
     const evaluator = mergeEvaluatorConfig(req.body?.evaluator);
-    const llmMutator = mergeLlmMutatorConfig(req.body?.llm_mutator);
-    const llmEnabled = Boolean(llmMutator.url || (llmMutator.base_url && llmMutator.api_key && llmMutator.model));
-    if (!llmEnabled) {
+    let llmMutator = mergeLlmMutatorConfig(req.body?.llm_mutator);
+    llmMutator = mergeQwenFromEnvDefaults(llmMutator);
+    llmMutator = finalizeQwenCredentials(llmMutator);
+
+    let llmExpand = mergeLlmExpandConfig(req.body?.llm_expand);
+    llmExpand = mergeQwenFromEnvDefaults(llmExpand);
+    llmExpand = finalizeQwenCredentials(llmExpand);
+
+    let llmScorer = mergeLlmScorerConfig(req.body?.llm_scorer);
+    llmScorer = mergeQwenFromEnvDefaults(llmScorer);
+    llmScorer = finalizeQwenCredentials(llmScorer);
+
+    const blockedDeepSeek =
+      [llmMutator, llmExpand, llmScorer].some(
+        (cfg) => endpointLooksLikeDeepSeek(cfg?.url) || endpointLooksLikeDeepSeek(cfg?.base_url)
+      );
+    if (blockedDeepSeek) {
       return res.status(422).json({
-        error: "llm_mutator is required in strict_llm_operator_mode",
+        error: "optimize forbids DeepSeek endpoints",
         details:
-          "Provide llm_mutator.url OR (llm_mutator.base_url + llm_mutator.api_key + llm_mutator.model)."
+          "优化接口仅允许 Qwen（DashScope 兼容 OpenAI）。请勿将 llm_mutator / llm_expand / llm_scorer 指向 DeepSeek；DeepSeek 兜底已关闭。"
       });
     }
-    const context = { prompt, evaluator, llmMutator };
+
+    const mutatorOk = llmClientEnabled(llmMutator);
+    const expandOk = llmClientEnabled(llmExpand);
+    if (config.mutation_mode === "llm_generate") {
+      if (!expandOk && !mutatorOk) {
+        return res.status(422).json({
+          error: "llm_generate requires llm_expand or llm_mutator credentials",
+          details:
+            "Provide llm_expand OR llm_mutator with url OR (base_url + api_key + model). Mutator is used when expand is omitted. Env: QWEN_API_KEY, QWEN_BASE_URL, QWEN_MODEL."
+        });
+      }
+    } else if (!mutatorOk) {
+      return res.status(422).json({
+        error: "llm_mutator is required in operator_select mode",
+        details:
+          "Provide llm_mutator.url OR (llm_mutator.base_url + llm_mutator.api_key + llm_mutator.model). Server fills only from QWEN_API_KEY, QWEN_BASE_URL, QWEN_MODEL when .env is loaded.",
+        diagnostics: mutatorDiagnostics(llmMutator)
+      });
+    }
+    const context = {
+      prompt,
+      evaluator,
+      llmMutator,
+      llmExpand,
+      llmScorer,
+      mutationMode: config.mutation_mode,
+      llmGenerateMaxRetries: config.llm_generate_max_retries,
+      enableLlmScorer: config.enable_llm_scorer
+    };
 
     const validSeeds = [];
     const rejectedSeeds = [];
@@ -1010,6 +1627,21 @@ router.post("/api/mwgl/optimize", async (req, res) => {
         temperature: llmMutator.temperature,
         max_tokens: llmMutator.max_tokens
       },
+      llm_expand: {
+        enabled: expandOk,
+        url: llmExpand.url || null,
+        base_url: llmExpand.url ? null : llmExpand.base_url || null,
+        timeout_ms: llmExpand.timeout_ms,
+        model: llmExpand.model || null,
+        temperature: llmExpand.temperature,
+        max_tokens: llmExpand.max_tokens
+      },
+      llm_scorer: {
+        enabled: llmClientEnabled(llmScorer),
+        url: llmScorer.url || null,
+        base_url: llmScorer.url ? null : llmScorer.base_url || null,
+        model: llmScorer.model || null
+      },
       seed_stats: {
         accepted: seedCandidates.length,
         rejected: rejectedSeeds.length
@@ -1030,7 +1662,13 @@ router.post("/api/mwgl/optimize", async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ error: error.message || "server error" });
+    const msg = error?.message || "server error";
+    const upstream =
+      msg.includes("Qwen chat/completions") ||
+      msg.includes("（operator_select）") ||
+      msg.startsWith("llm_expand.url") ||
+      msg.startsWith("llm_scorer.url");
+    res.status(upstream ? 502 : 500).json({ error: msg });
   }
 });
 

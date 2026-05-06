@@ -43,10 +43,14 @@
           <input type="checkbox" id="chkContextMode" checked />
           <span>上下文增量模式</span>
         </label>
-        <label class="chk-inline" title="生成成功后自动调用 /api/mwgl/optimize（MCTS），耗时更长">
-          <input type="checkbox" id="chkPostMcts" checked />
-          <span>生成后 MCTS 优化</span>
+        <label class="chk-inline" for="selectPostOptimize" title="生成成功后是否调用 /api/mwgl/optimize（需服务端 LLM；耗时随选项增加）">
+          <span>生成后优化</span>
         </label>
+        <select id="selectPostOptimize" aria-label="生成后优化">
+          <option value="none">无</option>
+          <option value="beam">束搜索</option>
+          <option value="mcts" selected>MCTS</option>
+        </select>
         <button id="btnParseMwgl">从 MWGL 文本导入</button>
         <button id="btnExportMwgl">导出 MWGL 文本</button>
         <button id="btnExportJson">导出 JSON</button>
