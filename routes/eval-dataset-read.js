@@ -4,12 +4,10 @@ import { Router } from "express";
 
 const router = Router();
 
-/**
- * 供前端「生成后优化」拉取评测约束；仅使用 full 数据集。
- */
+/** 供前端「生成后优化」拉取评测约束。 */
 router.get("/api/mwgl/eval-dataset", (_req, res) => {
   const cwd = process.cwd();
-  const rel = "data/eval_dataset.full.jsonl";
+  const rel = "data/eval_dataset.jsonl";
   const abs = path.join(cwd, rel);
   if (!fs.existsSync(abs)) {
     return res.json({ source: null, count: 0, items: [] });

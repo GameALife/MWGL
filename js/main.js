@@ -19,6 +19,8 @@ const elements = {
   jsonView: document.getElementById("jsonView"),
   mwglText: document.getElementById("mwglText"),
   nodeType: document.getElementById("nodeType"),
+  nodeOutcome: document.getElementById("nodeOutcome"),
+  endOutcomeRow: document.getElementById("endOutcomeRow"),
   nodeText: document.getElementById("nodeText"),
   nodeX: document.getElementById("nodeX"),
   nodeY: document.getElementById("nodeY"),
@@ -31,7 +33,18 @@ const elements = {
   runResultText: document.getElementById("runResultText"),
   codeLanguage: document.getElementById("codeLanguage"),
   constraintPanel: document.getElementById("constraintPanel"),
-  constraintList: document.getElementById("constraintList")
+  constraintList: document.getElementById("constraintList"),
+  loopPanel: document.getElementById("loopPanel"),
+  loopPanelTitle: document.getElementById("loopPanelTitle"),
+  loopPanelBreadcrumb: document.getElementById("loopPanelBreadcrumb"),
+  loopPanelClose: document.getElementById("loopPanelClose"),
+  loopKind: document.getElementById("loopKind"),
+  loopCondition: document.getElementById("loopCondition"),
+  loopSaveMeta: document.getElementById("loopSaveMeta"),
+  loopLoopStepList: document.getElementById("loopLoopStepList"),
+  loopAddStep: document.getElementById("loopAddStep"),
+  loopAddFor: document.getElementById("loopAddFor"),
+  loopAddSubflow: document.getElementById("loopAddSubflow")
 };
 
 function bootstrap() {

@@ -1,5 +1,5 @@
 /**
- * MWGL 语言实现（v2）。具体规则见 mwgl-v2.js。
+ * MWGL 语言实现（v3）。v2 图在 normalize 时自动迁移。
  */
 export {
   MWGL_VERSION,
@@ -8,9 +8,17 @@ export {
   hasDirectedPath,
   isAllowedMwglEdge,
   layoutWorkflowLeftToRight,
+  migrateWorkflowV2ToV3,
   mwglToWorkflow,
   normalizeWorkflow,
   validateWorkflowConstraints,
   wouldEdgeCreateCycle,
   workflowToMwgl
-} from "./mwgl-v2.js";
+} from "./mwgl-v3.js";
+
+export {
+  createEmptyLoop,
+  createLoopStepItem,
+  validateWorkflowLoops,
+  appendLoopPseudoForNode
+} from "./mwgl-loop.js";

@@ -1,8 +1,8 @@
 import fs from "fs";
 import path from "path";
+import { normalizeFinalState } from "./eval-lang.js";
 
-const DATASET_PATH = process.argv[2] || "data/eval_dataset.seed.jsonl";
-const ALLOWED_FINAL_STATES = new Set(["success", "failure"]);
+const DATASET_PATH = process.argv[2] || "data/eval_dataset.jsonl";
 const FORBIDDEN_LABELS = [/^\d+$/, /^分支\d+$/i, /^branch\d+$/i];
 
 function isObject(value) {
@@ -29,14 +29,33 @@ function validateLine(item, index) {
     return errors;
   }
 
-  const finalState = String(item.expected.final_state || "").trim();
-  if (!ALLOWED_FINAL_STATES.has(finalState)) {
-    errors.push(`line ${index}: expected.final_state must be success or failure`);
+  const finalState = normalizeFinalState(item.expected.final_state);
+  if (finalState !== "success" && finalState !== "failure") {
+    errors.push(
+      `line ${index}: expected.final_state must be success|failure|成功|失败`
+    );
+  }
+
+  if (item.input && Object.prototype.hasOwnProperty.call(item.input, "user_text_en")) {
+    errors.push(`line ${index}: input.user_text_en is deprecated; use user_text only`);
   }
 
   if (!Array.isArray(item.expected.must_have_path_labels)) {
     errors.push(`line ${index}: expected.must_have_path_labels must be array`);
     return errors;
+  }
+
+  if (item.expected.needs_branch != null && typeof item.expected.needs_branch !== "boolean") {
+    errors.push(`line ${index}: expected.needs_branch must be boolean`);
+  }
+  if (item.expected.needs_loop != null && typeof item.expected.needs_loop !== "boolean") {
+    errors.push(`line ${index}: expected.needs_loop must be boolean`);
+  }
+  if (item.expected.input_vars != null && !Array.isArray(item.expected.input_vars)) {
+    errors.push(`line ${index}: expected.input_vars must be array`);
+  }
+  if (item.expected.output_vars != null && !Array.isArray(item.expected.output_vars)) {
+    errors.push(`line ${index}: expected.output_vars must be array`);
   }
 
   const labels = item.expected.must_have_path_labels.map(normalizeLabel);

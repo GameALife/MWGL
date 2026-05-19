@@ -5,11 +5,10 @@ const router = Router();
 const MAX_REPAIR_ROUNDS = Number(process.env.MWGL_PSEUDO_MAX_RETRY || 2);
 
 const SYSTEM_PROMPT =
-  "你是 MWGL v2 伪代码生成器。将工作流 JSON 转为结构化伪代码。只输出伪代码，不要 markdown/代码块/解释。\n\n" +
-  "格式：缩进 2 空格，用关键字 BEGIN WORKFLOW / END WORKFLOW、STEP、IF / ELSE IF / ELSE、WHILE / END WHILE、PARALLEL / END PARALLEL（内含 BRANCH）、WAIT、SUCCESS、FAILURE。\n\n" +
-  "映射：start→STEP, wait_user→WAIT, case→STEP, success→SUCCESS, failure→FAILURE。\n" +
-  "switch→IF/ELSE IF/ELSE，出边 label 直接作为条件。loop_start/loop_end→WHILE/END WHILE，中间节点为循环体。parallel→PARALLEL，每条出边一个 BRANCH。\n\n" +
-  "边：顺序连接；非 switch 的非空 label 以注释体现。从 start 按拓扑顺序展开。不可达节点末尾注释列出。";
+  "你是 MWGL v3 伪代码生成器。将工作流 JSON 转为结构化伪代码。只输出伪代码，不要 markdown。\n\n" +
+  "格式：BEGIN WORKFLOW / END WORKFLOW；STEP；IF / ELSE IF / ELSE（条件来自 branch 出边 label）；END（success/failure 来自 end.outcome）。\n\n" +
+  "映射：start→STEP；step→STEP；branch→IF/ELSE IF/ELSE；end outcome=success→SUCCESS；end outcome=failure→FAILURE。\n" +
+  "从 start 按拓扑展开。若 step 含 loop 对象：按 loop.kind/condition 输出 FOR/WHILE 块，递归展开 loop.steps（含嵌套 loop、branch 各 arm、subflow 引用注释）。主图 edges 仍为 DAG。";
 
 function stripMarkdownFence(text) {
   return String(text || "")
@@ -18,26 +17,12 @@ function stripMarkdownFence(text) {
     .trim();
 }
 
-function countKeywordLines(text, keyword) {
-  const re = new RegExp(`^\\s*${keyword}\\b`, "gmi");
-  return (text.match(re) || []).length;
-}
-
 function validatePseudocodeContent(content) {
   const cleaned = stripMarkdownFence(content);
   const errors = [];
   if (!cleaned) errors.push("伪代码为空。");
   if (!/^\s*BEGIN WORKFLOW\b/m.test(cleaned)) errors.push("缺少 BEGIN WORKFLOW。");
   if (!/^\s*END WORKFLOW\b/m.test(cleaned)) errors.push("缺少 END WORKFLOW。");
-
-  const whileCount = countKeywordLines(cleaned, "WHILE");
-  const endWhileCount = countKeywordLines(cleaned, "END WHILE");
-  if (whileCount !== endWhileCount) errors.push("WHILE / END WHILE 数量不一致。");
-
-  const parallelCount = countKeywordLines(cleaned, "PARALLEL");
-  const endParallelCount = countKeywordLines(cleaned, "END PARALLEL");
-  if (parallelCount !== endParallelCount) errors.push("PARALLEL / END PARALLEL 数量不一致。");
-
   return { ok: errors.length === 0, errors, cleaned };
 }
 
@@ -80,7 +65,7 @@ router.post("/api/mwgl/pseudocode", async (req, res) => {
     for (let round = 1; round <= MAX_REPAIR_ROUNDS && !checked.ok; round += 1) {
       const repairPrompt = buildRepairPrompt({
         workflow,
-        previousText: checked.cleaned || stripMarkdownFence(content),
+        previousText: stripMarkdownFence(content),
         errors: checked.errors,
         round,
         maxRounds: MAX_REPAIR_ROUNDS
@@ -94,17 +79,14 @@ router.post("/api/mwgl/pseudocode", async (req, res) => {
 
     if (!checked.ok) {
       return res.status(422).json({
-        error: "伪代码生成多次修复后仍未通过校验：你的要求可能过于单薄或过于复杂，请补充具体信息或精简要求。",
+        error: "Pseudocode validation failed",
         details: checked.errors
       });
     }
 
     res.json({ content: checked.cleaned });
   } catch (error) {
-    if (error.status) {
-      return res.status(error.status).json({ error: error.message });
-    }
-    res.status(500).json({ error: error.message || "server error" });
+    res.status(500).json({ error: error?.message || "server error" });
   }
 });
 

@@ -58,57 +58,41 @@ export async function fetchEvalDataset({ base }) {
 }
 
 /**
- * 对已生成的工作流调用 `/api/mwgl/optimize`（束搜索或 MCTS；服务端仅使用 Qwen，需 QWEN_* 环境变量或显式 llm_mutator）。
- * @param {"beam"|"mcts"} algorithm
- * @returns {Promise<object>} best_workflow
+ * Top-4 多轮优化：DeepSeek 初池 + Qwen 整图改写，返回全程最高分 workflow。
  */
 export async function optimizeWorkflow({
   base,
   workflow,
   prompt,
   evalDataset,
-  algorithm = "mcts",
-  iterations = 12
+  top4SearchMode = "beam"
 }) {
-  const algo = String(algorithm || "mcts").toLowerCase();
-  if (algo !== "beam" && algo !== "mcts") {
-    throw new Error('algorithm 须为 "beam" 或 "mcts"');
-  }
   const root = String(base || "").trim().replace(/\/$/, "");
-  const it = Math.max(1, Math.floor(Number(iterations) || 12));
-  const config =
-    algo === "beam"
-      ? {
-          algorithm: "beam",
-          iterations: it,
-          beam_width: 4,
-          candidates_per_parent: 4
-        }
-      : {
-          algorithm: "mcts",
-          iterations: it,
-          beam_width: 6,
-          candidates_per_parent: 4,
-          mcts_exploration: 1.2,
-          mcts_rollout_steps: 2
-        };
+  const mode = String(top4SearchMode || "beam").toLowerCase() === "mcts" ? "mcts" : "beam";
+  const body = {
+    prompt: String(prompt || "").trim() || "MWGL 生成后优化",
+    initial_workflow: workflow,
+    eval_dataset: Array.isArray(evalDataset) ? evalDataset : [],
+    config: {
+      algorithm: "top4",
+      mutation_mode: "llm_generate",
+      top4_search_mode: mode,
+      top4_keep: 4,
+      top4_rounds: 2,
+      top4_mcts_extra_rounds: 1,
+      top4_mcts_exploration: 1.2,
+      top4_initial_pool: 8,
+      top4_children_per_parent: 2,
+      eval_topk: 8
+    }
+  };
 
   const res = await fetch(`${root}/api/mwgl/optimize`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json"
     },
-    body: JSON.stringify({
-      prompt: String(prompt || "").trim() || "MWGL 生成后优化",
-      initial_workflow: workflow,
-      eval_dataset: Array.isArray(evalDataset) ? evalDataset : [],
-      config,
-      evaluator: {
-        url: `${root}/api/mwgl/mock-evaluator`,
-        timeout_ms: 12000,
-        pass_through_prompt: true
-      }
-    })
+    body: JSON.stringify(body)
   });
 
   const text = await res.text();
@@ -134,9 +118,9 @@ export async function optimizeWorkflow({
   return normalizeWorkflow(best);
 }
 
-/** @deprecated 使用 {@link optimizeWorkflow} 并传 algorithm: "mcts" */
+/** @deprecated 与 {@link optimizeWorkflow} 相同（已移除束搜索/MCTS） */
 export async function optimizeWorkflowMcts(params) {
-  return optimizeWorkflow({ ...params, algorithm: "mcts" });
+  return optimizeWorkflow(params);
 }
 
 export async function pseudoToCode({ base, pseudocode, language }) {

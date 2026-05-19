@@ -1,15 +1,16 @@
 {
-  "name": "mwgl-studio-v2",
-  "version": "1.0.0",
+  "name": "mwgl-studio-v3",
+  "version": "3.0.0",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node server.js",
     "validate:eval-dataset": "node scripts/validate-eval-dataset.js",
+    "localize:eval-dataset-zh": "node scripts/localize-eval-dataset-zh.mjs",
+    "refresh:eval-expected": "node scripts/refresh-eval-expected.mjs",
     "synthesize:dataset": "node scripts/synthesize-dataset.js",
     "merge:eval-datasets": "node scripts/merge-eval-datasets.js",
-    "import:chat2workflow-dataset": "node scripts/import-chat2workflow-dataset.js",
-    "faiss:check": "python3 scripts/faiss-select.py --dataset data/eval_dataset.full.jsonl --prompt \"测试工作流优化\" --topk 5",
+    "faiss:check": "python3 scripts/faiss-select.py --dataset data/eval_dataset.jsonl --prompt \"测试工作流优化\" --topk 5",
     "build:eval-dataset": "node scripts/synthesize-dataset.js && node scripts/merge-eval-datasets.js",
     "run:optimize": "node scripts/run-optimize.js"
   },

@@ -1,8 +1,7 @@
 import fs from "fs";
 import path from "path";
 
-/** 默认使用「种子 + 合成」合并集；仅种子见 `data/eval_dataset.seed.jsonl`，合并脚本见 `scripts/merge-eval-datasets.js` */
-const DEFAULT_DATASET_PATH = "data/eval_dataset.full.jsonl";
+const DEFAULT_DATASET_PATH = "data/eval_dataset.jsonl";
 const DEFAULT_OUTPUT_PATH = "data/optimize_result.json";
 const DEFAULT_API_URL = "http://localhost:3001/api/mwgl/optimize";
 
@@ -30,14 +29,14 @@ function loadInitialWorkflow(filePath) {
       rule_name: "默认初始流程",
       nodes: [
         { id: "n_start", type: "start", text: "开始", x: 120, y: 180 },
-        { id: "n_case_validate", type: "case", text: "校验订单", x: 300, y: 180 },
-        { id: "n_success", type: "success", text: "成功结束", x: 520, y: 150 },
-        { id: "n_failure", type: "failure", text: "失败结束", x: 520, y: 240 }
+        { id: "n_step_validate", type: "step", text: "校验订单", x: 300, y: 180 },
+        { id: "n_end_ok", type: "end", outcome: "success", text: "订单处理成功", x: 520, y: 150 },
+        { id: "n_end_fail", type: "end", outcome: "failure", text: "订单未通过-支付异常", x: 520, y: 240 }
       ],
       edges: [
-        { id: "e_start_validate", from: "n_start", to: "n_case_validate", label: "" },
-        { id: "e_validate_ok", from: "n_case_validate", to: "n_success", label: "已支付" },
-        { id: "e_validate_fail", from: "n_case_validate", to: "n_failure", label: "异常" }
+        { id: "e_start_validate", from: "n_start", to: "n_step_validate", label: "" },
+        { id: "e_validate_ok", from: "n_step_validate", to: "n_end_ok", label: "" },
+        { id: "e_validate_fail", from: "n_step_validate", to: "n_end_fail", label: "" }
       ]
     };
   }
@@ -52,8 +51,7 @@ function parseArgs(argv) {
     output: DEFAULT_OUTPUT_PATH,
     url: DEFAULT_API_URL,
     initialWorkflowPath: "",
-    algorithm: "mcts",
-    iterations: 20
+    algorithm: "top4"
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -63,11 +61,11 @@ function parseArgs(argv) {
     else if (arg === "--url") result.url = argv[++i] || result.url;
     else if (arg === "--initial-workflow") result.initialWorkflowPath = argv[++i] || "";
     else if (arg === "--algorithm") result.algorithm = argv[++i] || result.algorithm;
-    else if (arg === "--iterations") result.iterations = Number(argv[++i] || result.iterations);
+    else if (arg === "--top4-rounds") result.top4Rounds = Number(argv[++i] || result.top4Rounds);
   }
 
-  if (!Number.isFinite(result.iterations) || result.iterations < 1) {
-    throw new Error("--iterations must be a positive number");
+  if (result.top4Rounds !== undefined && (!Number.isFinite(result.top4Rounds) || result.top4Rounds < 1)) {
+    throw new Error("--top4-rounds must be a positive number");
   }
   return result;
 }
@@ -82,17 +80,17 @@ async function main() {
     initial_workflow: initialWorkflow,
     eval_dataset: evalDataset,
     config: {
-      algorithm: args.algorithm,
-      iterations: Math.floor(args.iterations),
-      beam_width: 6,
-      candidates_per_parent: 4,
-      mcts_exploration: 1.2,
-      mcts_rollout_steps: 2
-    },
-    evaluator: {
-      url: "http://localhost:3001/api/mwgl/mock-evaluator",
-      timeout_ms: 3000,
-      pass_through_prompt: true
+      algorithm: "top4",
+      mutation_mode: "llm_generate",
+      top4_search_mode: "beam",
+      top4_keep: 4,
+      top4_rounds: Math.floor(args.top4Rounds || 2),
+      top4_mcts_extra_rounds: 1,
+      top4_mcts_exploration: 1.2,
+      top4_initial_pool: 8,
+      top4_children_per_parent: 2,
+      retrieval_mode: "faiss",
+      eval_topk: 24
     }
   };
 

@@ -5,6 +5,24 @@ import path from "path";
 import { execFileSync } from "child_process";
 import { Router } from "express";
 import { normalizeWorkflow, validateWorkflowConstraints } from "../js/mwgl.js";
+import { suggestOpsForWorkflow, isRuleMutationMode } from "./optimize-experience.js";
+import {
+  MUTATION_OPERATORS,
+  MUTATION_OP_IDS,
+  MUTATION_SEMANTICS_ZH
+} from "./optimize-mutations.js";
+import {
+  scoreWorkflow,
+  DEFAULT_SCORE_WEIGHTS,
+  mutationReward
+} from "./optimize-scoring.js";
+import { runTop4Search } from "../lib/mwgl-top4-search.mjs";
+import {
+  mergeGraphEditEvalConfig,
+  graphEditConfigFromEnv,
+  scoreGraphEditPair,
+  blendScoreWithGraphEdit
+} from "../lib/mwgl-graph-edit-eval.mjs";
 
 const router = Router();
 
@@ -12,28 +30,24 @@ const router = Router();
 const DEFAULT_QWEN_BASE = String(process.env.QWEN_BASE_URL || "").trim().replace(/\/$/, "");
 
 const DEFAULT_CONFIG = {
-  algorithm: "beam",
-  iterations: 12,
-  beam_width: 4,
-  candidates_per_parent: 4,
-  mcts_exploration: 1.2,
-  mcts_rollout_steps: 2,
-  /** 仅 MCTS：为 true 时在首层对每个种子枚举全部内置算子邻域（整图校验通过才挂枝），得到多条并列第一步 */
-  mcts_seed_expand_all_operators: false,
+  algorithm: "top4",
   eval_topk: 24,
   retrieval_mode: "faiss",
   max_nodes: 40,
-  /** operator_select：仅从代码预生成的合法邻图中选名；llm_generate：小模型直接产出整张合法 MWGL（可一步内配套多改） */
-  mutation_mode: "operator_select",
+  mutation_mode: "llm_generate",
   llm_generate_max_retries: 3,
-  /** 为 true 时才调用 llm_scorer；默认 false，仅用本地启发式 + 可选 HTTP evaluator */
   enable_llm_scorer: false,
-  weights: {
-    task_success: 1.0,
-    cost: 0.15,
-    latency: 0.1,
-    complexity: 0.2
-  }
+  weights: { ...DEFAULT_SCORE_WEIGHTS },
+  /** beam（默认）| mcts */
+  top4_search_mode: "beam",
+  top4_keep: 4,
+  top4_rounds: 2,
+  /** 仅 mcts：在 top4_rounds 之后再扩展的轮数 */
+  top4_mcts_extra_rounds: 1,
+  top4_mcts_exploration: 1.2,
+  top4_initial_pool: 8,
+  /** 固定 2：内容 + 结构双分支（见 MUTATION_BRANCHES） */
+  top4_children_per_parent: 2
 };
 const DEFAULT_EVALUATOR = {
   url: "",
@@ -76,8 +90,8 @@ const DEFAULT_LLM_SCORER = {
   api_key: ""
 };
 
-const TERMINAL_TYPES = new Set(["success", "failure"]);
-const NON_TERMINAL_TYPES = new Set(["start", "wait_user", "switch", "loop_start", "loop_end", "parallel", "case"]);
+const TERMINAL_TYPES = new Set(["end"]);
+const NON_TERMINAL_TYPES = new Set(["start", "step", "branch"]);
 
 function deepClone(value) {
   return JSON.parse(JSON.stringify(value || {}));
@@ -95,30 +109,42 @@ function clamp(num, min, max) {
 function mergeConfig(input) {
   const cfg = deepClone(DEFAULT_CONFIG);
   const source = input && typeof input === "object" ? input : {};
-  cfg.algorithm = String(source.algorithm || cfg.algorithm);
-  cfg.iterations = clamp(Math.floor(safeNumber(source.iterations, cfg.iterations)), 1, 100);
-  cfg.beam_width = clamp(Math.floor(safeNumber(source.beam_width, cfg.beam_width)), 1, 20);
-  cfg.candidates_per_parent = clamp(Math.floor(safeNumber(source.candidates_per_parent, cfg.candidates_per_parent)), 1, 20);
-  cfg.mcts_exploration = clamp(safeNumber(source.mcts_exploration, cfg.mcts_exploration), 0.05, 5);
-  cfg.mcts_rollout_steps = clamp(Math.floor(safeNumber(source.mcts_rollout_steps, cfg.mcts_rollout_steps)), 1, 6);
-  cfg.mcts_seed_expand_all_operators = Boolean(source.mcts_seed_expand_all_operators);
+  cfg.algorithm = "top4";
+  cfg.mutation_mode = "llm_generate";
   cfg.eval_topk = clamp(Math.floor(safeNumber(source.eval_topk, cfg.eval_topk)), 0, 200);
   cfg.retrieval_mode = String(source.retrieval_mode || cfg.retrieval_mode).trim().toLowerCase() === "faiss" ? "faiss" : "token";
   cfg.max_nodes = clamp(Math.floor(safeNumber(source.max_nodes, cfg.max_nodes)), 4, 500);
-  const mm = String(source.mutation_mode || cfg.mutation_mode || "")
-    .trim()
-    .toLowerCase();
-  cfg.mutation_mode = mm === "llm_generate" ? "llm_generate" : "operator_select";
+  const mode = String(source.top4_search_mode || cfg.top4_search_mode).trim().toLowerCase();
+  cfg.top4_search_mode = mode === "mcts" ? "mcts" : "beam";
+  cfg.top4_keep = clamp(Math.floor(safeNumber(source.top4_keep, cfg.top4_keep)), 1, 12);
+  cfg.top4_rounds = clamp(Math.floor(safeNumber(source.top4_rounds, cfg.top4_rounds)), 1, 12);
+  cfg.top4_initial_pool = clamp(
+    Math.floor(safeNumber(source.top4_initial_pool, cfg.top4_initial_pool)),
+    1,
+    24
+  );
+  cfg.top4_mcts_extra_rounds = clamp(
+    Math.floor(safeNumber(source.top4_mcts_extra_rounds, cfg.top4_mcts_extra_rounds)),
+    0,
+    8
+  );
+  cfg.top4_mcts_exploration = clamp(
+    safeNumber(source.top4_mcts_exploration, cfg.top4_mcts_exploration),
+    0.05,
+    5
+  );
+  cfg.top4_children_per_parent = 2;
   cfg.llm_generate_max_retries = clamp(
     Math.floor(safeNumber(source.llm_generate_max_retries, cfg.llm_generate_max_retries)),
     1,
     8
   );
   cfg.enable_llm_scorer = source.enable_llm_scorer === true;
-  cfg.weights.task_success = safeNumber(source.weights?.task_success, cfg.weights.task_success);
-  cfg.weights.cost = safeNumber(source.weights?.cost, cfg.weights.cost);
-  cfg.weights.latency = safeNumber(source.weights?.latency, cfg.weights.latency);
-  cfg.weights.complexity = safeNumber(source.weights?.complexity, cfg.weights.complexity);
+  for (const key of Object.keys(DEFAULT_SCORE_WEIGHTS)) {
+    if (source.weights?.[key] !== undefined) {
+      cfg.weights[key] = safeNumber(source.weights[key], cfg.weights[key]);
+    }
+  }
   return cfg;
 }
 
@@ -301,318 +327,25 @@ function canReachTerminal(workflow, fromNodeId) {
   return false;
 }
 
-function evaluateTaskSuccess(workflow, evalDataset) {
-  const reachable = reachableFromStart(workflow);
-  const terminals = (workflow.nodes || []).filter((n) => TERMINAL_TYPES.has(n.type) && reachable.has(n.id));
-  const hasSuccess = terminals.some((n) => n.type === "success");
-  const hasFailure = terminals.some((n) => n.type === "failure");
-  let structural = 0;
-  if (reachable.size > 0) structural += 0.35;
-  if (hasSuccess) structural += 0.35;
-  if (hasFailure) structural += 0.15;
-
-  const reachableNonTerminal = (workflow.nodes || []).filter(
-    (n) => NON_TERMINAL_TYPES.has(n.type) && reachable.has(n.id)
-  );
-  const progressOk = reachableNonTerminal.every((n) => canReachTerminal(workflow, n.id));
-  if (progressOk) structural += 0.15;
-  structural = clamp(structural, 0, 1);
-
-  if (!Array.isArray(evalDataset) || evalDataset.length === 0) {
-    return structural;
-  }
-
-  let pass = 0;
-  for (const item of evalDataset) {
-    const expected = item?.expected || {};
-    const desiredFinal = String(expected.final_state || "").trim();
-    const labels = Array.isArray(expected.must_have_path_labels) ? expected.must_have_path_labels : [];
-    let ok = true;
-    if (desiredFinal === "success" && !hasSuccess) ok = false;
-    if (desiredFinal === "failure" && !hasFailure) ok = false;
-    if (labels.length > 0) {
-      const allLabels = new Set((workflow.edges || []).map((e) => String(e.label || "").trim()).filter(Boolean));
-      if (!labels.every((x) => allLabels.has(String(x).trim()))) ok = false;
-    }
-    if (ok) pass += 1;
-  }
-  const datasetScore = pass / evalDataset.length;
-  return clamp(0.5 * structural + 0.5 * datasetScore, 0, 1);
-}
-
-function computeMetrics(workflow, evalDataset) {
-  const nodes = workflow.nodes || [];
-  const edges = workflow.edges || [];
-  const switches = nodes.filter((n) => n.type === "switch").length;
-  const parallels = nodes.filter((n) => n.type === "parallel").length;
-  const loops = nodes.filter((n) => n.type === "loop_start" || n.type === "loop_end").length;
-  const complexityRaw = nodes.length + 0.5 * edges.length + 2 * switches + 1.5 * parallels + loops;
-  const complexity = clamp(complexityRaw / 60, 0, 1);
-  const costRaw = nodes.length * 55 + edges.length * 20 + switches * 30 + parallels * 20;
-  const cost = clamp(costRaw / 3000, 0, 1);
-  const latencyRaw = nodes.length * 0.08 + parallels * 0.35;
-  const latency = clamp(latencyRaw / 8, 0, 1);
-  const taskSuccess = evaluateTaskSuccess(workflow, evalDataset);
-  return { task_success: taskSuccess, cost, latency, complexity };
-}
-
-function computeScore(metrics, weights) {
-  return (
-    weights.task_success * metrics.task_success -
-    weights.cost * metrics.cost -
-    weights.latency * metrics.latency -
-    weights.complexity * metrics.complexity
-  );
-}
-
-function nextNodeId(workflow, hint = "case") {
-  const ids = new Set((workflow.nodes || []).map((n) => String(n.id)));
-  let i = 1;
-  while (ids.has(`n_${hint}_${i}`)) i += 1;
-  return `n_${hint}_${i}`;
-}
-
-function nextEdgeId(workflow, hint = "flow") {
-  const ids = new Set((workflow.edges || []).map((e) => String(e.id)));
-  let i = 1;
-  while (ids.has(`e_${hint}_${i}`)) i += 1;
-  return `e_${hint}_${i}`;
-}
-
-function randomItem(list) {
-  if (!Array.isArray(list) || list.length === 0) return null;
-  return list[Math.floor(Math.random() * list.length)];
-}
-
-function pickCaseLikeNode(workflow) {
-  const candidates = (workflow.nodes || []).filter((n) => n.type === "case" || n.type === "wait_user");
-  return randomItem(candidates);
-}
-
-function opRenameTextForSemantics(workflow) {
-  const node = randomItem((workflow.nodes || []).filter((n) => n.type === "case"));
-  if (!node) return null;
-  const mutated = deepClone(workflow);
-  const target = mutated.nodes.find((n) => n.id === node.id);
-  if (!target) return null;
-  if (!target.text || /^新动作|未命名/.test(target.text)) {
-    target.text = "执行业务动作";
-  } else if (!target.text.includes("（优化）")) {
-    target.text = `${target.text}（优化）`;
-  } else {
-    target.text = target.text.replace("（优化）", "");
-  }
-  return { workflow: mutated, op: "rename_text_for_semantics" };
-}
-
-function opChangeEdgeLabel(workflow) {
-  const candidates = (workflow.edges || []).filter((e) => typeof e.label === "string");
-  const edge = randomItem(candidates);
-  if (!edge) return null;
-  const pool = ["已认证", "未认证", "超时", "重试上限", "库存不足", "金额>1000"];
-  const mutated = deepClone(workflow);
-  const target = mutated.edges.find((e) => e.id === edge.id);
-  if (!target) return null;
-  target.label = randomItem(pool) || "条件满足";
-  return { workflow: mutated, op: "change_edge_label" };
-}
-
-function opAddFailurePath(workflow) {
-  const from = pickCaseLikeNode(workflow);
-  if (!from) return null;
-  const mutated = deepClone(workflow);
-  const failure = randomItem(mutated.nodes.filter((n) => n.type === "failure"));
-  let failureNode = failure;
-  if (!failureNode) {
-    if (mutated.nodes.length >= 200) return null;
-    failureNode = {
-      id: nextNodeId(mutated, "failure"),
-      type: "failure",
-      text: "失败结束",
-      x: 880,
-      y: 460
-    };
-    mutated.nodes.push(failureNode);
-  }
-  mutated.edges.push({
-    id: nextEdgeId(mutated, "failure"),
-    from: from.id,
-    to: failureNode.id,
-    label: "异常"
-  });
-  return { workflow: mutated, op: "add_failure_path" };
-}
-
-function opPruneRedundantCase(workflow) {
-  const mutated = deepClone(workflow);
-  const { out } = buildGraph(mutated);
-  const candidates = mutated.nodes.filter((n) => n.type === "case" && (out.get(n.id) || []).length === 1);
-  const target = randomItem(candidates);
-  if (!target) return null;
-  const inbound = mutated.edges.filter((e) => e.to === target.id);
-  const outbound = mutated.edges.find((e) => e.from === target.id);
-  if (!outbound) return null;
-  for (const inEdge of inbound) {
-    mutated.edges.push({
-      id: nextEdgeId(mutated, "bypass"),
-      from: inEdge.from,
-      to: outbound.to,
-      label: inEdge.label || ""
-    });
-  }
-  mutated.edges = mutated.edges.filter((e) => e.from !== target.id && e.to !== target.id);
-  mutated.nodes = mutated.nodes.filter((n) => n.id !== target.id);
-  return { workflow: mutated, op: "prune_redundant_case" };
-}
-
-function opAddSwitchAfterNode(workflow) {
-  const base = pickCaseLikeNode(workflow);
-  if (!base) return null;
-  const mutated = deepClone(workflow);
-  const baseOut = mutated.edges.filter((e) => e.from === base.id);
-  if (baseOut.length === 0) return null;
-  const original = baseOut[0];
-  mutated.edges = mutated.edges.filter((e) => e.id !== original.id);
-  const switchNodeId = nextNodeId(mutated, "switch");
-  const caseNodeId = nextNodeId(
-    { ...mutated, nodes: [...mutated.nodes, { id: switchNodeId }] },
-    "case"
-  );
-  mutated.nodes.push(
-    { id: switchNodeId, type: "switch", text: "条件判断", x: 540, y: 250 },
-    { id: caseNodeId, type: "case", text: "补充处理", x: 700, y: 320 }
-  );
-  mutated.edges.push(
-    { id: nextEdgeId(mutated, "sw_enter"), from: base.id, to: switchNodeId, label: "" },
-    { id: nextEdgeId(mutated, "sw_yes"), from: switchNodeId, to: original.to, label: "满足条件" },
-    { id: nextEdgeId(mutated, "sw_no"), from: switchNodeId, to: caseNodeId, label: "不满足条件" },
-    { id: nextEdgeId(mutated, "sw_join"), from: caseNodeId, to: original.to, label: "" }
-  );
-  return { workflow: mutated, op: "add_switch_after_node" };
-}
-
-function opParallelizeCases(workflow) {
-  const mutated = deepClone(workflow);
-  const start = findStartNode(mutated);
-  if (!start) return null;
-  const cases = mutated.nodes.filter((n) => n.type === "case").slice(0, 2);
-  if (cases.length < 2) return null;
-  const parallelId = nextNodeId(mutated, "parallel");
-  mutated.nodes.push({ id: parallelId, type: "parallel", text: "并行处理", x: 360, y: 240 });
-  const startEdge = mutated.edges.find((e) => e.from === start.id);
-  if (!startEdge) return null;
-  mutated.edges = mutated.edges.filter((e) => e.id !== startEdge.id);
-  mutated.edges.push(
-    { id: nextEdgeId(mutated, "p_start"), from: start.id, to: parallelId, label: "" },
-    { id: nextEdgeId(mutated, "p_a"), from: parallelId, to: cases[0].id, label: "并行分支A" },
-    { id: nextEdgeId(mutated, "p_b"), from: parallelId, to: cases[1].id, label: "并行分支B" }
-  );
-  return { workflow: mutated, op: "parallelize_cases" };
-}
-
-function opMergeParallelBranches(workflow) {
-  const mutated = deepClone(workflow);
-  const parallel = randomItem(mutated.nodes.filter((n) => n.type === "parallel"));
-  if (!parallel) return null;
-  const targets = mutated.edges.filter((e) => e.from === parallel.id).map((e) => e.to);
-  if (targets.length < 2) return null;
-  const joinCandidate = randomItem(mutated.nodes.filter((n) => n.type === "case" || n.type === "success"));
-  if (!joinCandidate) return null;
-  for (const t of targets) {
-    mutated.edges.push({
-      id: nextEdgeId(mutated, "join"),
-      from: t,
-      to: joinCandidate.id,
-      label: ""
-    });
-  }
-  return { workflow: mutated, op: "merge_parallel_branches" };
-}
-
-function opInsertRetryLoop(workflow) {
-  const base = pickCaseLikeNode(workflow);
-  if (!base) return null;
-  const mutated = deepClone(workflow);
-  const outEdge = mutated.edges.find((e) => e.from === base.id);
-  if (!outEdge) return null;
-  mutated.edges = mutated.edges.filter((e) => e.id !== outEdge.id);
-  const loopStartId = nextNodeId(mutated, "loop_start");
-  const loopEndId = nextNodeId({ ...mutated, nodes: [...mutated.nodes, { id: loopStartId }] }, "loop_end");
-  mutated.nodes.push(
-    { id: loopStartId, type: "loop_start", text: "重试循环开始", x: 520, y: 220 },
-    { id: loopEndId, type: "loop_end", text: "重试循环结束", x: 760, y: 220 }
-  );
-  mutated.edges.push(
-    { id: nextEdgeId(mutated, "loop_enter"), from: base.id, to: loopStartId, label: "" },
-    { id: nextEdgeId(mutated, "loop_body"), from: loopStartId, to: loopEndId, label: "" },
-    { id: nextEdgeId(mutated, "loop_exit"), from: loopEndId, to: outEdge.to, label: "退出循环" }
-  );
-  return { workflow: mutated, op: "insert_retry_loop" };
-}
-
-const OPERATORS = [
-  opAddSwitchAfterNode,
-  opChangeEdgeLabel,
-  opInsertRetryLoop,
-  opParallelizeCases,
-  opMergeParallelBranches,
-  opAddFailurePath,
-  opPruneRedundantCase,
-  opRenameTextForSemantics
-];
-
-/** 与内置算子 id 一致，供生成模型作「意图白名单」提示；无前置可用算子时退回全集 */
-const OPERATOR_HINT_IDS = [
-  "add_switch_after_node",
-  "change_edge_label",
-  "insert_retry_loop",
-  "parallelize_cases",
-  "merge_parallel_branches",
-  "add_failure_path",
-  "prune_redundant_case",
-  "rename_text_for_semantics"
-];
-
-/** 供 user 消息算子字段释义（与代码内置 OPERATORS 一致） */
-const OPERATOR_SEMANTICS_ZH = {
-  add_switch_after_node: "在合适节点后插入 switch，用出边 label 承载互斥条件",
-  change_edge_label: "修改边 label，常用于细化 switch 分支条件或其它转移语义",
-  insert_retry_loop: "在 case 类节点后插入重试循环（loop_start→loop_end 结构）",
-  parallelize_cases: "将若干并列 case 改为 parallel 并行语义",
-  merge_parallel_branches: "合并并行分支的汇聚结构",
-  add_failure_path: "补充 failure 终态路径，明确非成功业务结局",
-  prune_redundant_case: "删除或合并冗余 case 节点/边",
-  rename_text_for_semantics: "调整节点 text，使业务语义可读（须符合 failure 等非泛化文案要求）"
-};
-
-/**
- * 与 `validateWorkflowConstraints` + normalize 行为对齐的合法改写要点（小模型须按此自检）。
- * normalize 会过滤部分非法边以保持 DAG，仍应尽量一次性产出可通过校验的图。
- */
-const MWGL_V2_HARD_RULES_ZH = [
-  "【结构】全图为有向无环图（DAG）：禁止自环；边的 from/to 必须引用已存在节点 id；success/failure 禁止任何出边。",
-  "【入口】必须且仅能有一个 start；start 无入边；start 至少一条出边。",
-  "【终态】至少存在一个从 start 可达的 success 或 failure；从 start 可达的每个非终态节点都必须能到达某个终态（无执行死路）。",
-  "【分支】switch 至少一条出边；每条出边 label 非空、在同一 switch 下不重复；label 须为可判定业务语义（禁止纯数字、禁止「分支N」类占位）。",
-  "【并行】parallel 至少两条出边。",
-  "【循环】loop_start 有且仅有 1 条出边（进入循环体）；从该 loop_start 沿边必须能到达某个 loop_end；loop_end 至少一条出边；每个 loop_end 须能从某个 loop_start 到达（成对）。",
-  "【动作】case、wait_user 每个节点最多一条出边。",
-  "【失败节点】failure 的 text 不得为泛化词（如单独「失败」「failure」）；须写明具体失败语义（如任务未达成-超时、失败结局-生命值归零）。可选 failure_kind：game_lose | goal_not_met | precondition_not_met | risk_blocked。",
-  "【规模】节点数不得超过用户给出的 max_nodes。"
+const MWGL_V3_HARD_RULES_ZH = [
+  "【结构】全图为 DAG；禁止自环；end 禁止出边。",
+  "【类型】仅 start | step | branch | end；end 须含 outcome: success | failure。",
+  "【入口】唯一 start，无入边，至少一条出边。",
+  "【步骤】step 最多 1 条出边。",
+  "【分支】branch 至少 2 条出边；每条出边 label 非空、不重复、有业务语义（禁纯数字/分支N）。",
+  "【终态】至少一个从 start 可达的 end；可达非 end 节点须能到达 end。",
+  "【失败】outcome=failure 的 end 文案须具体，不能仅写「失败」。",
+  "【规模】节点数 ≤ max_nodes。循环/并行不在图中建模，写在 step 文案或由代码生成处理。"
 ].join("\n");
 
-/** operator_select：小模型仅从预生成合法邻域中选名 */
 const OPERATOR_SELECT_SYSTEM_ZH = [
-  "你是 MWGL 变异算子选择器。用户消息为 JSON：含 workflow、available_operators（字符串 id 列表）、prompt、max_nodes 等。",
-  "你必须且只能从 available_operators 中选择一个算子 id 执行改写；不得发明新 id。若当前列表均无法安全改进优化目标，则拒绝。",
-  "只输出一个 JSON 对象，两种形态之一：",
-  '{"decision":"choose","op":"<须等于列表中某项>"} 或 {"decision":"reject","reason":"<简短原因>"}。',
-  "禁止 markdown、禁止代码围栏、禁止 JSON 以外的文字。"
+  "你是 MWGL v3 变异算子选择器。只能从 available_operators 中选一项。",
+  '输出 {"decision":"choose","op":"..."} 或 {"decision":"reject","reason":"..."}。禁止 markdown。'
 ].join("\n");
 
 function listRelevantOperatorHints(parentWorkflow, maxNodes) {
   const hints = [];
-  for (const opFn of OPERATORS) {
+  for (const opFn of MUTATION_OPERATORS) {
     const candidate = opFn(parentWorkflow);
     if (!candidate) continue;
     if ((candidate.workflow.nodes || []).length > maxNodes) continue;
@@ -622,23 +355,25 @@ function listRelevantOperatorHints(parentWorkflow, maxNodes) {
 }
 
 const LLM_GENERATE_SYSTEM = [
-  "你是 MWGL v2 工作流「合法改写」专用小模型。用户消息为 JSON：含 phase（generate 或 repair）、prompt、workflow、max_nodes、relevant_operators；repair 时另有 previous_json、validation_errors。",
-  "",
-  "【任务】output 必须是替换后的**完整**工作流对象（整图替换，不是 patch）。可在一步内做多处配套修改（如同时调整 switch 分支与边标签）。phase=repair 时：必须在语义保持的前提下**逐项消除** validation_errors 中的全部校验错误后再输出。",
-  "",
-  "【输出契约 — 违反即视为失败】",
-  "- 你的回复中**有效内容仅为一个 JSON 对象**（表示 MWGL v2 工作流），首字符为「{」，末字符为「}」。",
-  "- **禁止** markdown、**禁止** ``` 代码围栏、**禁止** JSON 前后的说明/标题/注释/「以下是」等任何额外文本。",
-  "- **禁止** 外层再包一层：顶层字段必须是 mwgl_version、rule_id、rule_name、nodes、edges（勿仅用 workflow 键包裹内层对象）。",
-  "",
-  MWGL_V2_HARD_RULES_ZH,
-  "",
-  "【字段形状】顶层：mwgl_version（数字 2）、rule_id、rule_name、nodes、edges。nodes[]：id,type,text,x,y（数值坐标）；type=failure 时可含 failure_kind。edges[]：id,from,to,label（字符串）。type 枚举：start,wait_user,switch,loop_start,loop_end,parallel,case,success,failure。",
-  "",
-  "【relevant_operators / operator_hints】用户 JSON 中含 relevant_operators（id 列表）及 operator_hints（id+中文释义）；与业务 prompt 冲突时以可通过服务端校验（与实现 validateWorkflowConstraints 一致）为准。",
-  "",
-  "【自检】输出前在内心核对上述硬性规则；repair 阶段须对照 validation_errors 直到校验可通过。"
+  "你是 MWGL v3 工作流合法改写模型。输出完整 JSON 工作流，无 markdown。",
+  MWGL_V3_HARD_RULES_ZH,
+  "顶层：mwgl_version:3, rule_id, rule_name, nodes, edges。nodes：id,type,text,x,y；type=end 时含 outcome。edges：id,from,to,label。",
+  "type 枚举：start, step, branch, end。"
 ].join("\n");
+
+/** 束搜索 / MCTS 扩展时按「内容」「结构」分支注入 system 侧重点 */
+function buildLlmGenerateSystem(context) {
+  const focus = context?.mutationFocus;
+  if (!focus?.instruction_zh) return LLM_GENERATE_SYSTEM;
+  const label = focus.id === "structure" ? "结构" : "内容";
+  return [
+    LLM_GENERATE_SYSTEM,
+    "",
+    `【本轮改写类型：${label}（mutation_focus=${focus.id}）】`,
+    "必须严格按用户 JSON 中的 mutation_instruction_zh 执行；不得同时做大范围拓扑重写与全文润色。",
+    focus.instruction_zh
+  ].join("\n");
+}
 
 function stripMarkdownFence(text) {
   return String(text || "")
@@ -773,7 +508,8 @@ async function postChatCompletion(clientCfg, messages, options = {}) {
 }
 
 function buildGenerateUserPayload(context, expandCfg, parentWorkflow, maxNodes, relevantHints, phase, repair) {
-  const ops = relevantHints.length > 0 ? relevantHints : OPERATOR_HINT_IDS;
+  const ops = relevantHints.length > 0 ? relevantHints : MUTATION_OP_IDS;
+  const focus = context?.mutationFocus;
   const base = {
     phase,
     prompt: clientCfgPassPrompt(context, expandCfg),
@@ -787,8 +523,12 @@ function buildGenerateUserPayload(context, expandCfg, parentWorkflow, maxNodes, 
     output_requirement_zh:
       "模型回复正文只能是单个 MWGL v2 工作流 JSON 对象（mwgl_version,nodes,edges 等），禁止 markdown、禁止代码围栏、禁止任何额外说明。",
     validation_implies:
-      "服务端使用与本仓库 mwgl-v2.js 中 validateWorkflowConstraints 相同的规则校验你的输出；repair 阶段必须消除列出的全部 validation_errors。"
+      "服务端使用与本仓库 mwgl-v3.js 中 validateWorkflowConstraints 相同的规则校验你的输出；repair 阶段必须消除列出的全部 validation_errors。"
   };
+  if (focus?.id && focus?.instruction_zh) {
+    base.mutation_focus = focus.id;
+    base.mutation_instruction_zh = focus.instruction_zh;
+  }
   if (phase === "repair" && repair) {
     base.previous_json = repair.previousJson;
     base.validation_errors = repair.errorsText;
@@ -810,7 +550,7 @@ async function mutateWorkflowViaLlmGenerate(parentWorkflow, maxNodes, context) {
   }
 
   let relevantHints = listRelevantOperatorHints(parentWorkflow, maxNodes);
-  if (relevantHints.length === 0) relevantHints = [...OPERATOR_HINT_IDS];
+  if (relevantHints.length === 0) relevantHints = [...MUTATION_OP_IDS];
 
   const maxRounds = clamp(
     Math.floor(safeNumber(context?.llmGenerateMaxRetries, 3)),
@@ -853,7 +593,7 @@ async function mutateWorkflowViaLlmGenerate(parentWorkflow, maxNodes, context) {
       }
     }
     const messages = [
-      { role: "system", content: LLM_GENERATE_SYSTEM },
+      { role: "system", content: buildLlmGenerateSystem(context) },
       {
         role: "user",
         content: userBodyStr
@@ -887,13 +627,20 @@ async function mutateWorkflowViaLlmGenerate(parentWorkflow, maxNodes, context) {
 
   if (!checked.ok || !checked.normalized) return null;
   if ((checked.normalized.nodes || []).length > maxNodes) return null;
-  return { workflow: checked.normalized, op: "llm_generate" };
+  const focusId = context?.mutationFocus?.id;
+  const op =
+    focusId === "content"
+      ? "llm_generate_content"
+      : focusId === "structure"
+        ? "llm_generate_structure"
+        : "llm_generate";
+  return { workflow: checked.normalized, op };
 }
 
-/** 仅按「能不能执行这条算子」与节点上限筛选；不做整图硬校验（校验留在 beam/MCTS 扩展阶段） */
+/** 仅按「能不能执行这条算子」与节点上限筛选（operator_select 用） */
 function listValidOperatorChoices(parentWorkflow, maxNodes) {
   const validChoices = [];
-  for (const opFn of OPERATORS) {
+  for (const opFn of MUTATION_OPERATORS) {
     const candidate = opFn(parentWorkflow);
     if (!candidate) continue;
     if ((candidate.workflow.nodes || []).length > maxNodes) continue;
@@ -904,24 +651,6 @@ function listValidOperatorChoices(parentWorkflow, maxNodes) {
     });
   }
   return validChoices;
-}
-
-/** MCTS 种子层并列分枝：八种算子各试一遍，仅保留通过整图校验且不重复的邻图 */
-function listAllValidatedOperatorBranches(parentWorkflow, maxNodes) {
-  const out = [];
-  for (const opFn of OPERATORS) {
-    const candidate = opFn(parentWorkflow);
-    if (!candidate) continue;
-    if ((candidate.workflow.nodes || []).length > maxNodes) continue;
-    const normalized = normalizeWorkflow(candidate.workflow);
-    const check = validateWorkflowConstraints(normalized);
-    if (!check.ok) continue;
-    out.push({
-      op: candidate.op,
-      workflow: normalized
-    });
-  }
-  return out;
 }
 
 async function mutateWorkflowViaLlm(parentWorkflow, maxNodes, context) {
@@ -1033,8 +762,37 @@ async function mutateWorkflowViaLlm(parentWorkflow, maxNodes, context) {
   }
 }
 
+function mutateWorkflowByRule(parentWorkflow, maxNodes, context) {
+  const mode = context?.mutationMode || "rule_bandit";
+  const validChoices = listValidOperatorChoices(parentWorkflow, maxNodes);
+  if (validChoices.length === 0) return null;
+
+  const parentSig = workflowSignature(parentWorkflow);
+  const preferred = suggestOpsForWorkflow(parentWorkflow, validateWorkflowConstraints);
+
+  if (mode === "rule_random") {
+    const picked = validChoices[Math.floor(Math.random() * validChoices.length)];
+    return { workflow: picked.workflow, op: picked.op, parentSig };
+  }
+
+  const experience = context?.experience;
+  if (!experience) {
+    const picked = validChoices[Math.floor(Math.random() * validChoices.length)];
+    return { workflow: picked.workflow, op: picked.op, parentSig };
+  }
+
+  const picked = experience.selectOperator(parentSig, validChoices, preferred);
+  if (!picked) return null;
+  return { workflow: picked.workflow, op: picked.op, parentSig };
+}
+
 async function mutateWorkflow(parentWorkflow, maxNodes, context) {
-  const mode = context?.mutationMode || "operator_select";
+  const mode = context?.mutationMode || "rule_bandit";
+
+  if (isRuleMutationMode(mode)) {
+    return mutateWorkflowByRule(parentWorkflow, maxNodes, context);
+  }
+
   const mutator = context?.llmMutator;
   const hasMutator = llmClientEnabled(mutator);
   const expandResolved = resolveExpandClient(context);
@@ -1052,10 +810,28 @@ async function mutateWorkflow(parentWorkflow, maxNodes, context) {
   return null;
 }
 
-function computeLocalEvaluation(workflow, evalDataset, configWeights) {
-  const metrics = computeMetrics(workflow, evalDataset);
-  const score = computeScore(metrics, configWeights);
-  return { workflow, metrics, score };
+function recordMutationReward(context, parent, mutation, childScore) {
+  if (!context?.experience || !mutation?.op || !mutation?.parentSig) return;
+  const parentScore = Number(parent?.score) || 0;
+  context.experience.record(
+    mutation.parentSig,
+    mutation.op,
+    mutationReward(parentScore, childScore)
+  );
+}
+
+function computeLocalEvaluation(workflow, evalDataset, configWeights, context) {
+  const result = scoreWorkflow(workflow, {
+    evalDataset,
+    prompt: context?.prompt || "",
+    weights: configWeights
+  });
+  return {
+    workflow,
+    metrics: result.metrics,
+    score: result.score,
+    details: result.details
+  };
 }
 
 async function scoreViaLlm(local, workflow, evalDataset, context) {
@@ -1142,8 +918,47 @@ async function scoreViaLlm(local, workflow, evalDataset, context) {
   };
 }
 
+function applyGraphEditToEvaluation(local, workflow, context) {
+  const ge = context?.graphEditEval;
+  if (!ge?.enabled || !ge?.referenceWorkflow) {
+    return local;
+  }
+
+  const scored = scoreGraphEditPair(ge.referenceWorkflow, workflow, ge, {
+    lexical_fallback: ge.lexical_fallback === true
+  });
+  if (!scored.ok) {
+    return {
+      ...local,
+      details: {
+        ...(local.details || {}),
+        graph_edit_skipped: scored.error || "graph_edit_unavailable"
+      }
+    };
+  }
+
+  const blended = blendScoreWithGraphEdit(local.score, scored.similarity, ge.weight);
+  return {
+    ...local,
+    score: Number(blended.toFixed(6)),
+    metrics: {
+      ...local.metrics,
+      graph_edit_node_f1: scored.node_f1,
+      graph_edit_graph_f1: scored.graph_f1,
+      graph_edit_similarity: scored.similarity
+    },
+    details: {
+      ...(local.details || {}),
+      graph_edit_mode: scored.mode,
+      graph_edit_fallback: Boolean(scored.fallback),
+      graph_edit_local_score: local.score
+    }
+  };
+}
+
 async function evaluateCandidate(workflow, evalDataset, configWeights, context) {
-  const local = computeLocalEvaluation(workflow, evalDataset, configWeights);
+  let local = computeLocalEvaluation(workflow, evalDataset, configWeights, context);
+  local = applyGraphEditToEvaluation(local, workflow, context);
   const evaluator = context?.evaluator;
   if (evaluator?.url) {
     let timer = null;
@@ -1162,7 +977,8 @@ async function evaluateCandidate(workflow, evalDataset, configWeights, context) 
           workflow,
           eval_dataset: evalDataset,
           local_metrics: local.metrics,
-          local_score: local.score
+          local_score: local.score,
+          weights: configWeights
         })
       });
       if (!response.ok) {
@@ -1175,17 +991,12 @@ async function evaluateCandidate(workflow, evalDataset, configWeights, context) 
       }
       const remoteMetrics =
         payload?.metrics && typeof payload.metrics === "object"
-          ? {
-              task_success: safeNumber(payload.metrics.task_success, local.metrics.task_success),
-              cost: clamp(safeNumber(payload.metrics.cost, local.metrics.cost), 0, 1),
-              latency: clamp(safeNumber(payload.metrics.latency, local.metrics.latency), 0, 1),
-              complexity: clamp(safeNumber(payload.metrics.complexity, local.metrics.complexity), 0, 1)
-            }
+          ? { ...local.metrics, ...payload.metrics }
           : local.metrics;
       return {
         workflow,
         metrics: remoteMetrics,
-        score: remoteScore,
+        score: clamp(remoteScore, 0, 1),
         source: "remote"
       };
     } catch (_error) {
@@ -1225,286 +1036,6 @@ function workflowSignature(workflow) {
   return `${nodeParts.join(";")}::${edgeParts.join(";")}`;
 }
 
-function summarizeTopk(items) {
-  return items.map((x) => ({
-    id: x.id,
-    score: Number(x.score.toFixed(6)),
-    metrics: {
-      success: Number(x.metrics.task_success.toFixed(6)),
-      cost: Number(x.metrics.cost.toFixed(6)),
-      latency: Number(x.metrics.latency.toFixed(6)),
-      complexity: Number(x.metrics.complexity.toFixed(6))
-    },
-    op: x.op
-  }));
-}
-
-async function runBeamSearch(seedCandidates, evalDataset, config, context) {
-  let beam = seedCandidates.slice(0, config.beam_width);
-  let best = beam[0];
-  const history = [];
-  const keptMutations = new Set();
-  const droppedReasons = { constraint_failed: 0, mutation_failed: 0, invalid_after_normalize: 0 };
-
-  for (let iter = 1; iter <= config.iterations; iter += 1) {
-    const pool = [];
-    for (const parent of beam) {
-      for (let i = 0; i < config.candidates_per_parent; i += 1) {
-        const mutation = await mutateWorkflow(parent.workflow, config.max_nodes, context);
-        if (!mutation) {
-          droppedReasons.mutation_failed += 1;
-          continue;
-        }
-        const normalized = normalizeWorkflow(mutation.workflow);
-        const check = validateWorkflowConstraints(normalized);
-        if (!check.ok) {
-          droppedReasons.constraint_failed += 1;
-          continue;
-        }
-        const judged = await evaluateCandidate(normalized, evalDataset, config.weights, context);
-        pool.push({
-          ...judged,
-          op: mutation.op,
-          id: `wf_${iter}_${parent.id}_${i + 1}`
-        });
-      }
-    }
-
-    if (pool.length === 0) break;
-    const ranked = dedupeBySignature(pool).sort((a, b) => b.score - a.score);
-    if (ranked.length === 0) {
-      droppedReasons.invalid_after_normalize += 1;
-      break;
-    }
-
-    beam = ranked.slice(0, config.beam_width);
-    for (const item of beam) keptMutations.add(item.op);
-    if (beam[0].score > best.score) best = beam[0];
-
-    history.push({
-      iter,
-      phase: "beam",
-      best_score: Number(beam[0].score.toFixed(6)),
-      best_candidate_id: beam[0].id,
-      topk: summarizeTopk(beam)
-    });
-  }
-
-  return { best, history, keptMutations, droppedReasons };
-}
-
-async function runMctsSearch(seedCandidates, evalDataset, config, context) {
-  const root = {
-    id: "mcts_root",
-    rewardSum: 0,
-    visits: 0,
-    op: "forest_root",
-    parent: null,
-    children: [],
-    triedOps: new Set()
-  };
-  const nodesBySignature = new Map();
-  const history = [];
-  const keptMutations = new Set();
-  const droppedReasons = { constraint_failed: 0, mutation_failed: 0, duplicate_state: 0 };
-  let best = seedCandidates[0];
-  let nodeCounter = 0;
-
-  for (const seed of seedCandidates) {
-    const signature = workflowSignature(seed.workflow);
-    if (nodesBySignature.has(signature)) continue;
-    nodeCounter += 1;
-    const child = {
-      id: `mcts_seed_${nodeCounter}`,
-      workflow: seed.workflow,
-      metrics: seed.metrics,
-      score: seed.score,
-      rewardSum: 0,
-      visits: 0,
-      op: "seed",
-      parent: root,
-      children: [],
-      triedOps: new Set(),
-      source: seed.source
-    };
-    root.children.push(child);
-    nodesBySignature.set(signature, child);
-  }
-
-  if (config.mcts_seed_expand_all_operators) {
-    for (const seedNode of root.children) {
-      const branches = listAllValidatedOperatorBranches(seedNode.workflow, config.max_nodes);
-      for (const br of branches) {
-        const sig = workflowSignature(br.workflow);
-        if (nodesBySignature.has(sig)) continue;
-        nodeCounter += 1;
-        const judged = await evaluateCandidate(br.workflow, evalDataset, config.weights, context);
-        const branchNode = {
-          id: `mcts_seed_br_${nodeCounter}`,
-          workflow: br.workflow,
-          metrics: judged.metrics,
-          score: judged.score,
-          rewardSum: 0,
-          visits: 0,
-          op: br.op,
-          parent: seedNode,
-          children: [],
-          triedOps: new Set(),
-          source: judged.source
-        };
-        nodesBySignature.set(sig, branchNode);
-        seedNode.children.push(branchNode);
-        keptMutations.add(br.op);
-        if (judged.score > best.score) {
-          best = {
-            workflow: br.workflow,
-            metrics: judged.metrics,
-            score: judged.score,
-            source: judged.source,
-            id: branchNode.id,
-            op: br.op
-          };
-        }
-      }
-    }
-  }
-
-  function uctValue(parent, child) {
-    if (child.visits === 0) return Number.POSITIVE_INFINITY;
-    const exploit = child.rewardSum / child.visits;
-    const explore = config.mcts_exploration * Math.sqrt(Math.log(parent.visits + 1) / child.visits);
-    return exploit + explore;
-  }
-
-  function selectNode(startNode) {
-    let cur = startNode;
-    while (cur.children.length > 0) {
-      let picked = cur.children[0];
-      let bestUct = uctValue(cur, picked);
-      for (const child of cur.children.slice(1)) {
-        const v = uctValue(cur, child);
-        if (v > bestUct) {
-          bestUct = v;
-          picked = child;
-        }
-      }
-      cur = picked;
-    }
-    return cur;
-  }
-
-  async function expandNode(leaf) {
-    for (let tries = 0; tries < 8; tries += 1) {
-      const mutation = await mutateWorkflow(leaf.workflow, config.max_nodes, context);
-      if (!mutation) {
-        droppedReasons.mutation_failed += 1;
-        continue;
-      }
-      const normalized = normalizeWorkflow(mutation.workflow);
-      const check = validateWorkflowConstraints(normalized);
-      if (!check.ok) {
-        droppedReasons.constraint_failed += 1;
-        continue;
-      }
-      const signature = workflowSignature(normalized);
-      if (nodesBySignature.has(signature)) {
-        droppedReasons.duplicate_state += 1;
-        continue;
-      }
-      nodeCounter += 1;
-      const judged = await evaluateCandidate(normalized, evalDataset, config.weights, context);
-      const child = {
-        id: `mcts_${nodeCounter}`,
-        workflow: normalized,
-        metrics: judged.metrics,
-        score: judged.score,
-        rewardSum: 0,
-        visits: 0,
-        op: mutation.op,
-        parent: leaf,
-        children: [],
-        triedOps: new Set(),
-        source: judged.source
-      };
-      nodesBySignature.set(signature, child);
-      leaf.children.push(child);
-      keptMutations.add(mutation.op);
-      return child;
-    }
-    return null;
-  }
-
-  async function rollout(startNode) {
-    let current = startNode.workflow;
-    let evalResult = { metrics: startNode.metrics, score: startNode.score };
-    for (let step = 0; step < config.mcts_rollout_steps; step += 1) {
-      const mutation = await mutateWorkflow(current, config.max_nodes, context);
-      if (!mutation) break;
-      const normalized = normalizeWorkflow(mutation.workflow);
-      const check = validateWorkflowConstraints(normalized);
-      if (!check.ok) continue;
-      evalResult = await evaluateCandidate(normalized, evalDataset, config.weights, context);
-      current = normalized;
-    }
-    return evalResult.score;
-  }
-
-  function backpropagate(node, reward) {
-    let cur = node;
-    while (cur) {
-      cur.visits += 1;
-      cur.rewardSum += reward;
-      cur = cur.parent;
-    }
-  }
-
-  for (let iter = 1; iter <= config.iterations; iter += 1) {
-    const leaf = selectNode(root);
-    const expanded = (await expandNode(leaf)) || leaf;
-    const reward = await rollout(expanded);
-    backpropagate(expanded, reward);
-
-    if (expanded.score > best.score) {
-      best = expanded;
-    }
-    const frontier = root.children
-      .map((n) => ({
-        id: n.id,
-        op: n.op,
-        score: n.score,
-        visits: n.visits,
-        meanReward: n.visits > 0 ? n.rewardSum / n.visits : 0,
-        metrics: n.metrics,
-        source: n.source || "unknown"
-      }))
-      .sort((a, b) => b.meanReward - a.meanReward)
-      .slice(0, config.beam_width);
-
-    history.push({
-      iter,
-      phase: "mcts",
-      best_score: Number(best.score.toFixed(6)),
-      best_candidate_id: best.id,
-      root_visits: root.visits,
-      topk: frontier.map((x) => ({
-        id: x.id,
-        score: Number(x.score.toFixed(6)),
-        mean_reward: Number(x.meanReward.toFixed(6)),
-        visits: x.visits,
-        metrics: {
-          success: Number(x.metrics.task_success.toFixed(6)),
-          cost: Number(x.metrics.cost.toFixed(6)),
-          latency: Number(x.metrics.latency.toFixed(6)),
-          complexity: Number(x.metrics.complexity.toFixed(6))
-        },
-        op: x.op
-      }))
-    });
-  }
-
-  return { best, history, keptMutations, droppedReasons, root };
-}
-
 router.post("/api/mwgl/optimize", async (req, res) => {
   try {
     const prompt = String(req.body?.prompt || "").trim();
@@ -1515,11 +1046,14 @@ router.post("/api/mwgl/optimize", async (req, res) => {
     const candidateSeeds = [];
     if (singleWorkflow) candidateSeeds.push(singleWorkflow);
     for (const wf of multipleWorkflows) candidateSeeds.push(wf);
-    if (candidateSeeds.length === 0) {
-      return res.status(400).json({ error: "initial_workflow or initial_workflows is required" });
-    }
-
     const config = mergeConfig(req.body?.config);
+
+    if (candidateSeeds.length === 0 && !prompt) {
+      return res.status(400).json({
+        error: "prompt or initial_workflow is required",
+        details: "无种子图时需 prompt 以并行 DeepSeek 生成初稿。"
+      });
+    }
     const rawEvalDataset = Array.isArray(req.body?.eval_dataset) ? req.body.eval_dataset : [];
     const evalDataset = selectRelevantEvalDataset(rawEvalDataset, prompt, config);
     const evaluator = mergeEvaluatorConfig(req.body?.evaluator);
@@ -1549,31 +1083,37 @@ router.post("/api/mwgl/optimize", async (req, res) => {
 
     const mutatorOk = llmClientEnabled(llmMutator);
     const expandOk = llmClientEnabled(llmExpand);
-    if (config.mutation_mode === "llm_generate") {
-      if (!expandOk && !mutatorOk) {
-        return res.status(422).json({
-          error: "llm_generate requires llm_expand or llm_mutator credentials",
-          details:
-            "Provide llm_expand OR llm_mutator with url OR (base_url + api_key + model). Mutator is used when expand is omitted. Env: QWEN_API_KEY, QWEN_BASE_URL, QWEN_MODEL."
-        });
-      }
-    } else if (!mutatorOk) {
+
+    if (!expandOk && !mutatorOk) {
       return res.status(422).json({
-        error: "llm_mutator is required in operator_select mode",
+        error: "optimize requires llm_expand or llm_mutator (Qwen)",
         details:
-          "Provide llm_mutator.url OR (llm_mutator.base_url + llm_mutator.api_key + llm_mutator.model). Server fills only from QWEN_API_KEY, QWEN_BASE_URL, QWEN_MODEL when .env is loaded.",
-        diagnostics: mutatorDiagnostics(llmMutator)
+          "Top-4 在第 1 轮起对父代并行 llm_generate。请配置 QWEN_API_KEY、QWEN_BASE_URL、QWEN_MODEL。"
       });
     }
+
+    const graphEditCfg = mergeGraphEditEvalConfig(req.body?.graph_edit_eval, graphEditConfigFromEnv());
+    let referenceWorkflow = req.body?.reference_workflow
+      ? normalizeWorkflow(req.body.reference_workflow)
+      : null;
+
     const context = {
       prompt,
       evaluator,
       llmMutator,
       llmExpand,
       llmScorer,
-      mutationMode: config.mutation_mode,
+      experience: null,
+      mutationMode: "llm_generate",
       llmGenerateMaxRetries: config.llm_generate_max_retries,
-      enableLlmScorer: config.enable_llm_scorer
+      enableLlmScorer: config.enable_llm_scorer,
+      graphEditEval: graphEditCfg.enabled
+        ? {
+            ...graphEditCfg,
+            referenceWorkflow,
+            lexical_fallback: req.body?.graph_edit_eval?.lexical_fallback === true
+          }
+        : null
     };
 
     const validSeeds = [];
@@ -1588,26 +1128,37 @@ router.post("/api/mwgl/optimize", async (req, res) => {
       validSeeds.push(normalizedSeed);
     }
 
-    if (validSeeds.length === 0) {
+    if (validSeeds.length === 0 && !prompt) {
       return res.status(422).json({
-        error: "all initial workflows failed validation",
+        error: "no valid initial workflow and no prompt",
         details: rejectedSeeds
       });
     }
 
-    const seedCandidates = [];
-    let seedCounter = 0;
-    for (const seed of dedupeBySignature(validSeeds.map((workflow) => ({ workflow }))).map((x) => x.workflow)) {
-      seedCounter += 1;
-      const judged = await evaluateCandidate(seed, evalDataset, config.weights, context);
-      seedCandidates.push({ ...judged, op: "seed", id: `wf_seed_${seedCounter}` });
-    }
-    seedCandidates.sort((a, b) => b.score - a.score);
+    const top4Seeds = dedupeBySignature(validSeeds.map((workflow) => ({ workflow }))).map(
+      (x) => x.workflow
+    );
 
-    const runResult =
-      config.algorithm === "mcts"
-        ? await runMctsSearch(seedCandidates, evalDataset, config, context)
-        : await runBeamSearch(seedCandidates, evalDataset, config, context);
+    if (context.graphEditEval?.enabled && !context.graphEditEval.referenceWorkflow && top4Seeds.length > 0) {
+      context.graphEditEval.referenceWorkflow = top4Seeds[0];
+    }
+
+    const runResult = await runTop4Search({
+      prompt,
+      seedWorkflows: top4Seeds,
+      evalDataset,
+      config,
+      context,
+      evaluateCandidate,
+      mutateWorkflow
+    });
+    if (!runResult.best?.workflow) {
+      return res.status(422).json({
+        error: "optimize produced no valid workflow",
+        history: runResult.history,
+        dropped: runResult.dropped
+      });
+    }
 
     res.json({
       prompt,
@@ -1642,8 +1193,21 @@ router.post("/api/mwgl/optimize", async (req, res) => {
         base_url: llmScorer.url ? null : llmScorer.base_url || null,
         model: llmScorer.model || null
       },
+      graph_edit_eval: context.graphEditEval
+        ? {
+            enabled: context.graphEditEval.enabled,
+            weight: context.graphEditEval.weight,
+            reference_from:
+              req.body?.reference_workflow != null
+                ? "request"
+                : top4Seeds.length > 0
+                  ? "initial_seed"
+                  : "initial_pool_top1",
+            lexical_fallback: context.graphEditEval.lexical_fallback === true
+          }
+        : { enabled: false },
       seed_stats: {
-        accepted: seedCandidates.length,
+        accepted: validSeeds.length,
         rejected: rejectedSeeds.length
       },
       eval_dataset_stats: {
@@ -1654,11 +1218,26 @@ router.post("/api/mwgl/optimize", async (req, res) => {
       best_workflow: runResult.best.workflow,
       best_score: Number(runResult.best.score.toFixed(6)),
       history: runResult.history,
+      search_stats: {
+        stopped_early: Boolean(runResult.stoppedEarly),
+        global_best_id: runResult.best?.id ?? null,
+        top4: {
+          dropped: runResult.dropped,
+          final_pool: runResult.pool?.length,
+          mcts: runResult.mcts
+        }
+      },
       explain: {
-        kept_mutations: Array.from(runResult.keptMutations),
-        dropped_reasons: Object.entries(runResult.droppedReasons)
-          .filter(([, v]) => v > 0)
-          .map(([k]) => k)
+        mode: config.top4_search_mode === "mcts" ? "top4_mcts" : "top4_beam",
+        search_mode: runResult.search_mode || config.top4_search_mode,
+        selection: "global_best",
+        rounds: config.top4_rounds,
+        mcts_extra_rounds:
+          config.top4_search_mode === "mcts" ? config.top4_mcts_extra_rounds : 0,
+        branches: ["content", "structure"],
+        keep: config.top4_keep,
+        mcts: runResult.mcts,
+        history: runResult.history
       }
     });
   } catch (error) {

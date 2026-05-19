@@ -342,12 +342,18 @@ export function createRenderer(elements) {
       elements.nodeText.value = "";
       elements.nodeX.value = "";
       elements.nodeY.value = "";
+      if (elements.endOutcomeRow) elements.endOutcomeRow.classList.add("hidden");
       return;
     }
     elements.nodeType.value = node.type;
     elements.nodeText.value = node.text;
     elements.nodeX.value = String(node.x);
     elements.nodeY.value = String(node.y);
+    if (elements.endOutcomeRow && elements.nodeOutcome) {
+      const isEnd = node.type === "end";
+      elements.endOutcomeRow.classList.toggle("hidden", !isEnd);
+      if (isEnd) elements.nodeOutcome.value = node.outcome === "failure" ? "failure" : "success";
+    }
   }
 
   function render() {
@@ -371,9 +377,10 @@ export function createRenderer(elements) {
     ensureEdgeLayer();
     wf.nodes.forEach((node) => {
       const div = document.createElement("div");
-      const loopInCase =
-        node.type === "case" && String(node.text || "").trimStart().startsWith("【循环】");
-      div.className = `node ${node.type}${loopInCase ? " case-loop" : ""}${
+      const endClass =
+        node.type === "end" ? ` end-${node.outcome === "failure" ? "failure" : "success"}` : "";
+      const loopClass = node.loop ? " has-loop" : "";
+      div.className = `node ${node.type}${endClass}${loopClass}${
         state.selectedNodeId === node.id ? " selected" : ""
       }`;
       div.style.left = `${WORLD_WIDTH / 2 + node.x}px`;
@@ -381,7 +388,7 @@ export function createRenderer(elements) {
       div.dataset.id = node.id;
       div.innerHTML = `
         <button class="node-delete" type="button" title="删除节点" aria-label="删除节点">×</button>
-        <div class="type">${node.type}</div>
+        <div class="type">${node.loop ? `${node.type} · ${node.loop.kind || "for"}` : node.type}</div>
         <div class="text">${node.text}</div>
       `;
       worldEl.appendChild(div);
@@ -400,7 +407,7 @@ export function createRenderer(elements) {
     }
 
     elements.jsonView.textContent = JSON.stringify(
-      { ...wf, mwgl_version: wf.mwgl_version ?? 2 },
+      { ...wf, mwgl_version: wf.mwgl_version ?? 3 },
       null,
       2
     );

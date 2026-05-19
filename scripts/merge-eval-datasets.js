@@ -3,7 +3,7 @@
  * 合并种子评测集与合成评测集（顺序：先 seed，后 synthetic），校验 id 唯一后写出。
  *
  *   node scripts/merge-eval-datasets.js
- *   node scripts/merge-eval-datasets.js --out data/eval_dataset.full.jsonl
+ *   node scripts/merge-eval-datasets.js --out data/eval_dataset.jsonl
  */
 
 import fs from "fs";
@@ -15,7 +15,7 @@ function parseArgs(argv) {
   const o = {
     seed: "data/eval_dataset.seed.jsonl",
     synthetic: "data/synthetic_eval.jsonl",
-    out: "data/eval_dataset.full.jsonl"
+    out: "data/eval_dataset.jsonl"
   };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];

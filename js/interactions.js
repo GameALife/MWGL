@@ -11,8 +11,10 @@ import {
   layoutWorkflowLeftToRight,
   mwglToWorkflow,
   validateWorkflowConstraints,
-  workflowToMwgl
+  workflowToMwgl,
+  createEmptyLoop
 } from "./mwgl.js";
+import { createLoopEditor } from "./loop-editor.js";
 import { state, uid } from "./state.js";
 import { NODE_LAYOUT_HEIGHT, NODE_LAYOUT_WIDTH, WORLD_HEIGHT, WORLD_WIDTH, screenToUser } from "./viewport.js";
 
@@ -213,20 +215,52 @@ export function bindInteractions(elements, renderer) {
   }
 
   const selectPostOptimizeEl = document.getElementById("selectPostOptimize");
+  const selectTop4SearchModeEl = document.getElementById("selectTop4SearchMode");
+  const optimizeHintEl = document.getElementById("optimizeHint");
   const chkContextModeEl = document.getElementById("chkContextMode");
+
+  function syncOptimizeUi() {
+    const enabled = selectPostOptimizeEl?.value === "top4";
+    if (selectTop4SearchModeEl) {
+      selectTop4SearchModeEl.disabled = !enabled;
+    }
+    if (!optimizeHintEl) return;
+    if (!enabled) {
+      optimizeHintEl.textContent = "";
+      return;
+    }
+    const mcts = selectTop4SearchModeEl?.value === "mcts";
+    optimizeHintEl.textContent = mcts
+      ? "Top-4 + MCTS：DeepSeek 初池 8→4；每轮 UCT 选父代，Qwen 并行「内容」「结构」两路（约 3 轮，需 QWEN_*）。返回全程最高分。"
+      : "Top-4 + 束搜索：DeepSeek 初池 8→4；每轮对 top4 全扩，每图 Qwen「内容」「结构」两路（约 2 轮，需 QWEN_*）。返回全程最高分。";
+  }
+
   if (selectPostOptimizeEl) {
     let savedOpt = localStorage.getItem("mwgl_post_optimize");
     if (savedOpt === null) {
       const legacy = localStorage.getItem("mwgl_post_mcts");
-      savedOpt = legacy === "0" ? "none" : "mcts";
+      savedOpt = legacy === "0" ? "none" : "top4";
     }
-    if (savedOpt === "none" || savedOpt === "beam" || savedOpt === "mcts") {
+    if (savedOpt === "beam" || savedOpt === "mcts") savedOpt = "top4";
+    if (savedOpt === "none" || savedOpt === "top4") {
       selectPostOptimizeEl.value = savedOpt;
     }
     selectPostOptimizeEl.addEventListener("change", () => {
       localStorage.setItem("mwgl_post_optimize", selectPostOptimizeEl.value);
+      syncOptimizeUi();
     });
   }
+  if (selectTop4SearchModeEl) {
+    const savedMode = localStorage.getItem("mwgl_top4_search_mode");
+    if (savedMode === "beam" || savedMode === "mcts") {
+      selectTop4SearchModeEl.value = savedMode;
+    }
+    selectTop4SearchModeEl.addEventListener("change", () => {
+      localStorage.setItem("mwgl_top4_search_mode", selectTop4SearchModeEl.value);
+      syncOptimizeUi();
+    });
+  }
+  syncOptimizeUi();
   if (chkContextModeEl) {
     const saved = localStorage.getItem("mwgl_context_mode");
     if (saved !== null) chkContextModeEl.checked = saved === "1";
@@ -289,7 +323,7 @@ export function bindInteractions(elements, renderer) {
         .map((e) => String(e.label || "").trim())
         .filter(Boolean)
     );
-    if (fromNode.type === "switch") {
+    if (fromNode.type === "branch") {
       if (!labels.has("是")) return "是";
       if (!labels.has("否")) return "否";
       for (let i = 3; i <= 99; i += 1) {
@@ -309,52 +343,55 @@ export function bindInteractions(elements, renderer) {
   }
 
   const defaultTextForType = {
-    start: "开始 新入口",
-    wait_user: "等待用户 输入或确认",
-    switch: "条件 新分支",
-    loop_start: "循环开始 进入循环体（退出统一在 loop_end 后）",
-    loop_end: "循环结束 本轮结束后的收束节点",
-    parallel: "并行分支 可同时执行多个动作",
-    case: "新动作",
-    success: "成功 任务完成",
-    failure: "任务未达成 超时未完成"
+    start: "开始",
+    step: "执行业务步骤",
+    branch: "条件判断",
+    end_success: "任务完成",
+    end_failure: "任务未达成-条件不满足"
   };
 
-  function inferFailureKindFromText(text) {
-    const t = String(text || "").trim().toLowerCase();
-    if (!t) return "goal_not_met";
-    if (/结局|lose|死亡|团灭|败北/.test(t)) return "game_lose";
-    if (/前置|未认证|未授权|不满足|资格/.test(t)) return "precondition_not_met";
-    if (/风控|拦截|封禁|黑名单|命中规则/.test(t)) return "risk_blocked";
-    return "goal_not_met";
+  function addForLoopNode() {
+    recordWorkflowCheckpoint();
+    const node = {
+      id: uid(),
+      type: "step",
+      text: "for 循环",
+      x: Math.round(-120 + Math.random() * 240),
+      y: Math.round(-100 + Math.random() * 200),
+      loop: createEmptyLoop("for", "")
+    };
+    state.workflow.nodes.push(node);
+    state.selectedNodeId = node.id;
+    state.selectedEdgeId = null;
+    render();
+    persistActiveSessionNow();
+    loopEditor?.openForNode(node.id);
   }
 
-  function addNode(type) {
+  function addNode(typeOrKind) {
     recordWorkflowCheckpoint();
-    if (type === "switch" || type === "loop_start" || type === "parallel") {
+    let type = typeOrKind;
+    let outcome;
+    if (typeOrKind === "end_success") {
+      type = "end";
+      outcome = "success";
+    } else if (typeOrKind === "end_failure") {
+      type = "end";
+      outcome = "failure";
+    }
+
+    if (type === "branch") {
       const x = 120 + Math.floor(Math.random() * 220);
       const y = 120 + Math.floor(Math.random() * 260);
-      const br = {
-        id: uid(),
-        type,
-        text: defaultTextForType[type]
-      };
-      Object.assign(br, { x, y });
-      const c1 = { id: uid(), type: "case", text: "新动作", x: x + 280, y: y - 48 };
-      state.workflow.nodes.push(br, c1);
+      const br = { id: uid(), type: "branch", text: defaultTextForType.branch, x, y };
+      const s1 = { id: uid(), type: "step", text: "分支步骤A", x: x + 280, y: y - 48 };
+      const s2 = { id: uid(), type: "step", text: "分支步骤B", x: x + 280, y: y + 48 };
+      state.workflow.nodes.push(br, s1, s2);
       state.workflow.edges = state.workflow.edges || [];
-      if (type === "switch" || type === "parallel") {
-        const c2 = { id: uid(), type: "case", text: "新动作", x: x + 280, y: y + 48 };
-        state.workflow.nodes.push(c2);
-        const l1 = type === "switch" ? "是" : "";
-        const l2 = type === "switch" ? "否" : "";
-        state.workflow.edges.push(
-          { id: uid("e"), from: br.id, to: c1.id, label: l1 },
-          { id: uid("e"), from: br.id, to: c2.id, label: l2 }
-        );
-      } else {
-        state.workflow.edges.push({ id: uid("e"), from: br.id, to: c1.id, label: "" });
-      }
+      state.workflow.edges.push(
+        { id: uid("e"), from: br.id, to: s1.id, label: "是" },
+        { id: uid("e"), from: br.id, to: s2.id, label: "否" }
+      );
       state.selectedNodeId = br.id;
       state.selectedEdgeId = null;
       layoutWorkflowLeftToRight(state.workflow);
@@ -363,15 +400,16 @@ export function bindInteractions(elements, renderer) {
       persistActiveSessionNow();
       return;
     }
+
     const node = {
       id: uid(),
       type,
-      text: defaultTextForType[type] || "新节点",
+      text: defaultTextForType[typeOrKind] || defaultTextForType.step,
       x: Math.round(-120 + Math.random() * 240),
       y: Math.round(-100 + Math.random() * 200)
     };
-    if (type === "failure") {
-      node.failure_kind = inferFailureKindFromText(node.text);
+    if (type === "end") {
+      node.outcome = outcome || "success";
     }
     state.workflow.nodes.push(node);
     state.selectedNodeId = node.id;
@@ -388,10 +426,10 @@ export function bindInteractions(elements, renderer) {
     const nextType = elements.nodeType.value;
     node.type = nextType;
     node.text = elements.nodeText.value.trim() || "未命名节点";
-    if (nextType === "failure") {
-      node.failure_kind = inferFailureKindFromText(node.text);
-    } else if (Object.prototype.hasOwnProperty.call(node, "failure_kind")) {
-      delete node.failure_kind;
+    if (nextType === "end") {
+      node.outcome = elements.nodeOutcome?.value === "failure" ? "failure" : "success";
+    } else if (Object.prototype.hasOwnProperty.call(node, "outcome")) {
+      delete node.outcome;
     }
     node.x = Number(elements.nodeX.value || 0);
     node.y = Number(elements.nodeY.value || 0);
@@ -429,7 +467,7 @@ export function bindInteractions(elements, renderer) {
     state.workflow.edges = state.workflow.edges || [];
 
     const fromNodeForLabel = state.workflow.nodes.find((n) => n.id === from);
-    if (!label && fromNodeForLabel?.type === "switch") {
+    if (!label && fromNodeForLabel?.type === "branch") {
       label = guessLabelForEdge(from);
       elements.edgeLabel.value = label;
     }
@@ -465,7 +503,7 @@ export function bindInteractions(elements, renderer) {
     elements.edgeSelect.value = createdEdge.id;
     render();
     persistActiveSessionNow();
-    if (fromNodeForLabel?.type === "switch" && label) {
+    if (fromNodeForLabel?.type === "branch" && label) {
       setTimeout(() => focusEdgeLabelInput(), 0);
     }
     setStatus("连线已新增。");
@@ -541,9 +579,10 @@ export function bindInteractions(elements, renderer) {
       let optFail = "";
       let optDone = false;
       let optTail = "";
-      if (postOpt === "beam" || postOpt === "mcts") {
-        const label = postOpt === "beam" ? "束搜索" : "MCTS";
-        setStatus(`DeepSeek 已完成，正在进行 ${label} 优化（可能需十余秒）...`);
+      if (postOpt === "top4") {
+        const searchMode = selectTop4SearchModeEl?.value === "mcts" ? "mcts" : "beam";
+        const modeLabel = searchMode === "mcts" ? "MCTS" : "束搜索";
+        setStatus(`DeepSeek 已完成，正在进行 Top-4 ${modeLabel} 优化（内容/结构双分支，需 Qwen）...`);
         try {
           const evalDataset = await fetchEvalDataset({ base });
           workflow = await optimizeWorkflow({
@@ -551,13 +590,12 @@ export function bindInteractions(elements, renderer) {
             workflow,
             prompt,
             evalDataset,
-            algorithm: postOpt,
-            iterations: 12
+            top4SearchMode: searchMode
           });
           optDone = true;
-          optTail = `（已做 ${label} 优化）`;
+          optTail = `（已做 Top-4 ${modeLabel} 优化）`;
         } catch (optErr) {
-          optFail = ` ${label} 优化失败（已保留 DeepSeek 结果）：${optErr.message}`;
+          optFail = ` Top-4 ${modeLabel} 优化失败（已保留 DeepSeek 结果）：${optErr.message}`;
         }
       }
 
@@ -654,6 +692,17 @@ export function bindInteractions(elements, renderer) {
       setStatus(`快速自检失败：${error.message}`, true);
     }
   }
+
+  const loopEditor = createLoopEditor({
+    elements,
+    state,
+    setStatus,
+    onChange: () => {
+      recordWorkflowCheckpoint();
+      render();
+      persistActiveSessionNow();
+    }
+  });
 
   function bindCanvasEvents() {
     function syncEdgeSelectionToEditor(edgeId) {
@@ -886,6 +935,10 @@ export function bindInteractions(elements, renderer) {
       elements.edgeSelect.value = "";
       state.selectedNodeId = nodeEl.dataset.id;
       render();
+      const node = state.workflow.nodes.find((n) => n.id === state.selectedNodeId);
+      if (node?.loop) {
+        loopEditor.openForNode(node.id);
+      }
     });
 
     window.addEventListener("keydown", (event) => {
@@ -1028,14 +1081,16 @@ export function bindInteractions(elements, renderer) {
     });
 
     document.getElementById("addEvent").addEventListener("click", () => addNode("start"));
-    document.getElementById("addWaitUser").addEventListener("click", () => addNode("wait_user"));
-    document.getElementById("addSwitch").addEventListener("click", () => addNode("switch"));
-    document.getElementById("addLoopStart").addEventListener("click", () => addNode("loop_start"));
-    document.getElementById("addLoopEnd").addEventListener("click", () => addNode("loop_end"));
-    document.getElementById("addParallel").addEventListener("click", () => addNode("parallel"));
-    document.getElementById("addCase").addEventListener("click", () => addNode("case"));
-    document.getElementById("addSuccess").addEventListener("click", () => addNode("success"));
-    document.getElementById("addFailure").addEventListener("click", () => addNode("failure"));
+    document.getElementById("addStep").addEventListener("click", () => addNode("step"));
+    document.getElementById("addForLoop")?.addEventListener("click", () => addForLoopNode());
+    document.getElementById("addBranch").addEventListener("click", () => addNode("branch"));
+    document.getElementById("addEndSuccess").addEventListener("click", () => addNode("end_success"));
+    document.getElementById("addEndFailure").addEventListener("click", () => addNode("end_failure"));
+    elements.nodeType?.addEventListener("change", () => {
+      if (elements.endOutcomeRow) {
+        elements.endOutcomeRow.classList.toggle("hidden", elements.nodeType.value !== "end");
+      }
+    });
     document.getElementById("btnLayoutLr").addEventListener("click", () => {
       recordWorkflowCheckpoint();
       layoutWorkflowLeftToRight(state.workflow);

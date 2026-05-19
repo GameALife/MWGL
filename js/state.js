@@ -1,11 +1,11 @@
-import { NODE_TYPES } from "./mwgl-v2.js";
+import { NODE_TYPES } from "./mwgl.js";
 
 export { NODE_TYPES };
 export { uid } from "./ids.js";
 
 export const state = {
   workflow: {
-    mwgl_version: 2,
+    mwgl_version: 3,
     rule_id: "R_BLANK",
     rule_name: "空白工作流",
     nodes: [],

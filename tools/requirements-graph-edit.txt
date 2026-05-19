@@ -1,0 +1,4 @@
+# RobustFlow graph_evaluator 依赖（与 MWGL-Robust tools/requirements-eval.txt 一致）
+networkx>=3.2
+numpy>=1.24
+sentence-transformers>=3.0

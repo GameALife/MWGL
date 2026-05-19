@@ -3,15 +3,15 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MWGL Studio v2</title>
+  <title>MWGL Studio v3</title>
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
   <div class="app">
     <div class="panel">
-      <h1>MWGL Studio <span class="ver">v2</span></h1>
+      <h1>MWGL Studio <span class="ver">v3</span></h1>
       <p class="desc">
-        <strong>MWGL v2</strong>：节点含 <code>start</code>（唯一入口）、<code>wait_user</code>（等待用户交互，中间节点）、<code>switch</code>、<code>loop_start</code>/<code>loop_end</code>（循环开始/结束，可在两者间插入复杂逻辑）、<code>parallel</code>（并行分支）、<code>case</code>、<code>success</code> / <code>failure</code>（终态无出边）。边主要表达顺序连接，<code>label</code> 承载分支/触发条件语义。图保持 DAG，勿用连线回环。紧凑文本支持 <code>RULE</code>、<code>VERSION 2</code>、<code>开始</code>、<code>条件</code>、<code>CASE</code>；复杂图用 <code>MODE graph</code> + <code>NODE</code>/<code>EDGE</code>。
+        <strong>MWGL v3</strong>：主图仅 <code>start</code> / <code>step</code> / <code>branch</code> / <code>end</code>（DAG）。<code>for</code> 循环用 <code>step.loop.steps</code> 树 + 可选 <code>subworkflows</code>；点击带 ↻ 的节点编辑循环体，支持嵌套 for。
       </p>
     </div>
 
@@ -35,7 +35,7 @@
       </div>
       <div>
         <label for="userPrompt">用户输入（自然语言）</label>
-        <textarea id="userPrompt" placeholder="例如：当订单支付成功，条件 金额是否大于1000，CASE &quot;是&quot; 通知财务；CASE &quot;否&quot; 记录日志"></textarea>
+        <textarea id="userPrompt" placeholder="例如：订单支付成功后，若金额大于 1000 则通知财务，否则记录日志，最后标记处理完成"></textarea>
       </div>
       <div class="toolbar">
         <button class="btn-primary" id="btnGenerate">调用 DeepSeek 生成 MWGL</button>
@@ -43,14 +43,18 @@
           <input type="checkbox" id="chkContextMode" checked />
           <span>上下文增量模式</span>
         </label>
-        <label class="chk-inline" for="selectPostOptimize" title="生成成功后是否调用 /api/mwgl/optimize（需服务端 LLM；耗时随选项增加）">
-          <span>生成后优化</span>
-        </label>
-        <select id="selectPostOptimize" aria-label="生成后优化">
-          <option value="none">无</option>
-          <option value="beam">束搜索</option>
-          <option value="mcts" selected>MCTS</option>
-        </select>
+        <div class="optimize-bar" id="optimizeBar">
+          <span class="optimize-bar-label">生成后优化</span>
+          <select id="selectPostOptimize" aria-label="是否进行 Top-4 优化">
+            <option value="none">关闭</option>
+            <option value="top4" selected>开启 Top-4</option>
+          </select>
+          <span class="optimize-bar-label">搜索</span>
+          <select id="selectTop4SearchMode" aria-label="Top-4 搜索方式">
+            <option value="beam" selected>束搜索（默认）</option>
+            <option value="mcts">MCTS（UCT）</option>
+          </select>
+        </div>
         <button id="btnParseMwgl">从 MWGL 文本导入</button>
         <button id="btnExportMwgl">导出 MWGL 文本</button>
         <button id="btnExportJson">导出 JSON</button>
@@ -65,6 +69,7 @@
           <option value="Go">Go</option>
         </select>
       </div>
+      <p class="optimize-hint" id="optimizeHint" aria-live="polite"></p>
       <div class="status" id="status"></div>
       <aside class="error-panel hidden" id="constraintPanel" aria-live="polite">
         <div class="error-panel-title">约束错误</div>
@@ -76,14 +81,11 @@
       <div class="panel">
         <div class="toolbar toolbar-nodes">
           <button id="addEvent">start</button>
-          <button id="addWaitUser">wait_user</button>
-          <button id="addSwitch">switch</button>
-          <button id="addLoopStart">loop_start</button>
-          <button id="addLoopEnd">loop_end</button>
-          <button id="addParallel">parallel</button>
-          <button id="addCase">case</button>
-          <button id="addSuccess">success</button>
-          <button id="addFailure">failure</button>
+          <button id="addStep">step</button>
+          <button id="addForLoop">for 循环</button>
+          <button id="addBranch">branch</button>
+          <button id="addEndSuccess">end ✓</button>
+          <button id="addEndFailure">end ✗</button>
           <button id="btnLayoutLr" type="button">从左到右排列</button>
         </div>
         <div class="canvas" id="canvas" tabindex="0">
@@ -91,24 +93,50 @@
             <div class="canvas-world" id="canvasWorld"></div>
           </div>
         </div>
-        <div class="hint">工作流默认居中在画布内；空白处拖拽平移；Ctrl+滚轮缩放；节点可拖动；Shift+拖节点可连线；点击边可选中并按 Delete/Backspace 删除。</div>
+                <div class="hint">工作流默认居中在画布内；空白处拖拽平移；Ctrl+滚轮缩放；节点可拖动；Shift+拖节点可连线；带 <strong>for</strong> 的节点点击可编辑循环体。</div>
       </div>
 
-      <div class="panel">
+      <aside id="loopPanel" class="loop-panel hidden" aria-label="循环体编辑">
+        <div class="loop-panel-header">
+          <h2 id="loopPanelTitle">循环体</h2>
+          <button type="button" id="loopPanelClose" class="loop-panel-close" title="关闭">×</button>
+        </div>
+        <p id="loopPanelBreadcrumb" class="loop-breadcrumb"></p>
+        <div class="loop-field">
+          <label for="loopKind">循环类型</label>
+          <select id="loopKind"><option value="for">for</option><option value="while">while</option></select>
+        </div>
+        <div class="loop-field">
+          <label for="loopCondition">条件 / 迭代</label>
+          <input id="loopCondition" placeholder="重试次数 &lt; 3" />
+        </div>
+        <button type="button" id="loopSaveMeta" class="btn-primary loop-save-meta">保存循环条件</button>
+        <div id="loopLoopStepList" class="loop-step-list"></div>
+        <div class="toolbar loop-toolbar">
+          <button type="button" id="loopAddStep">+ 步骤</button>
+          <button type="button" id="loopAddFor">+ 嵌套 for</button>
+          <button type="button" id="loopAddSubflow">+ 子工作流</button>
+        </div>
+      </aside>
+
+
+            <div class="panel">
         <label for="nodeType">节点类型</label>
         <select id="nodeType">
           <option value="start">start</option>
-          <option value="wait_user">wait_user</option>
-          <option value="switch">switch</option>
-          <option value="loop_start">loop_start</option>
-          <option value="loop_end">loop_end</option>
-          <option value="parallel">parallel</option>
-          <option value="case">case</option>
-          <option value="success">success</option>
-          <option value="failure">failure</option>
+          <option value="step">step</option>
+          <option value="branch">branch</option>
+          <option value="end">end</option>
         </select>
+        <div id="endOutcomeRow" class="hidden">
+          <label for="nodeOutcome">终态 outcome</label>
+          <select id="nodeOutcome">
+            <option value="success">success</option>
+            <option value="failure">failure</option>
+          </select>
+        </div>
         <label for="nodeText">节点文本</label>
-        <textarea id="nodeText" placeholder="节点显示内容。需反复判断时合并为一个 case，并以【循环】开头写明语义"></textarea>
+        <textarea id="nodeText" placeholder="step：动词+对象；branch：条件说明；end failure：具体失败语义"></textarea>
         <div class="grid-2">
           <div>
             <label for="nodeX">X（画布中心为 0，右为正）</label>
@@ -129,7 +157,7 @@
         <select id="edgeFrom"></select>
         <label for="edgeTo">连线终点</label>
         <select id="edgeTo"></select>
-        <label for="edgeLabel">分支/触发条件标签（switch 出发必填）</label>
+        <label for="edgeLabel">分支标签（从 branch 出发必填）</label>
         <input id="edgeLabel" placeholder="例如：已认证、金额>1000" />
         <label for="edgeSelect">已有连线</label>
         <select id="edgeSelect"></select>
@@ -142,8 +170,8 @@
 
     <div class="split">
       <div class="panel">
-        <label for="mwglText">MWGL 文本</label>
-        <textarea id="mwglText"></textarea>
+        <label for="mwglText">MWGL 文本（MODE graph）</label>
+        <textarea id="mwglText" placeholder="RULE R_xxx &quot;规则名&quot;&#10;VERSION 2&#10;MODE graph&#10;NODE n_start start &quot;开始&quot;&#10;EDGE n_start -> n_next &quot;&quot;"></textarea>
       </div>
       <div class="panel">
         <label>JSON（工作流结构）</label>

@@ -105,6 +105,39 @@ input:focus, textarea:focus, select:focus { border-color: #9ca3af; }
   user-select: none;
   margin: 0 4px;
 }
+.optimize-bar {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f9fafb;
+}
+.optimize-bar-label {
+  font-size: 12px;
+  color: #6b7280;
+  white-space: nowrap;
+}
+.optimize-bar select {
+  font-size: 13px;
+  padding: 4px 8px;
+  min-width: 0;
+}
+.optimize-bar select:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.optimize-hint {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #6b7280;
+}
+.optimize-hint:empty {
+  display: none;
+}
 .toolbar-nodes button {
   font-size: 12px;
   padding: 6px 8px;
@@ -275,33 +308,22 @@ button:hover { background: #f9fafb; }
   background: #fee2e2;
 }
 .node.start { background: var(--event); }
-.node.wait_user { background: var(--wait-user); }
-.node.switch { background: var(--switch); }
-.node.loop_start { background: var(--loop-start); }
-.node.loop_end { background: var(--loop-end); }
-.node.parallel { background: var(--parallel); }
-.node.case { background: var(--case); }
-.node.success { background: var(--success); }
-.node.failure { background: var(--failure); }
-.node.case-loop {
-  border-left: 5px solid #a855f7;
-  background: linear-gradient(90deg, rgba(168, 85, 247, 0.12), var(--case));
-  box-shadow: 0 2px 12px rgba(168, 85, 247, 0.2);
-}
-.node.case-loop .type::after {
-  content: " · 内循环";
-  color: #7c3aed;
+.node.step { background: var(--case); }
+.node.branch { background: var(--switch); }
+.node.end,
+.node.end-success { background: var(--success); }
+.node.end-failure { background: var(--failure); }
+.node.end .type::after {
+  content: "";
   font-weight: 600;
 }
-.node.loop_start .type::after {
-  content: " · 循环开始";
-  color: #86198f;
-  font-weight: 600;
+.node.end-success .type::after {
+  content: " · success";
+  color: #15803d;
 }
-.node.loop_end .type::after {
-  content: " · 循环结束";
-  color: #86198f;
-  font-weight: 600;
+.node.end-failure .type::after {
+  content: " · failure";
+  color: #b91c1c;
 }
 .hint {
   font-size: 12px;
@@ -400,3 +422,79 @@ pre {
   .grid-2, .split { grid-template-columns: 1fr; }
   .canvas { height: 460px; }
 }
+
+/* for 循环节点与循环体编辑面板 */
+.node.has-loop {
+  border: 2px solid #7c3aed;
+  background: linear-gradient(135deg, #f5f3ff 0%, #ede9fe 100%);
+  box-shadow: 0 2px 14px rgba(124, 58, 237, 0.25);
+}
+.node.has-loop .type::after {
+  content: " ↻";
+  color: #6d28d9;
+  font-weight: 700;
+}
+.loop-panel {
+  position: fixed;
+  right: 20px;
+  top: 72px;
+  width: 360px;
+  max-height: calc(100vh - 96px);
+  overflow: auto;
+  z-index: 100;
+  background: #fff;
+  border: 1px solid #c4b5fd;
+  border-radius: 12px;
+  padding: 12px 14px;
+  box-shadow: 0 12px 40px rgba(15, 23, 42, 0.18);
+}
+.loop-panel.hidden { display: none; }
+.loop-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.loop-panel-header h2 { margin: 0; font-size: 16px; }
+.loop-panel-close {
+  border: none;
+  background: transparent;
+  font-size: 22px;
+  cursor: pointer;
+  color: #64748b;
+}
+.loop-breadcrumb {
+  font-size: 12px;
+  color: #64748b;
+  margin: 0 0 10px;
+}
+.loop-field { margin-bottom: 8px; }
+.loop-field label { font-size: 12px; color: #475569; }
+.loop-save-meta { width: 100%; margin-bottom: 10px; }
+.loop-step-list { margin: 8px 0; }
+.loop-step-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  margin-bottom: 6px;
+  background: #f8fafc;
+}
+.loop-step-head { display: flex; gap: 8px; align-items: flex-start; flex: 1; min-width: 0; }
+.loop-step-text { font-size: 13px; word-break: break-word; }
+.loop-badge {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+.loop-badge-step { background: #dbeafe; color: #1d4ed8; }
+.loop-badge-loop { background: #ede9fe; color: #6d28d9; }
+.loop-badge-subflow { background: #ffedd5; color: #c2410c; }
+.loop-badge-branch { background: #dcfce7; color: #15803d; }
+.loop-toolbar { flex-wrap: wrap; gap: 6px; }
+.loop-hint { font-size: 12px; color: #64748b; }
