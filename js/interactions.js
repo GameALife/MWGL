@@ -2,8 +2,10 @@ import {
   buildWorkflowByDeepSeek,
   dagToPseudocode,
   fetchEvalDataset,
+  fetchWorkflowSuggestions,
   optimizeWorkflow,
   pseudoToCode,
+  repairCodeFromCheck,
   runCodeQuickCheck
 } from "./api.js";
 import {
@@ -15,8 +17,12 @@ import {
   createEmptyLoop
 } from "./mwgl.js";
 import { createLoopEditor } from "./loop-editor.js";
+import { bindHighlightScroll, syncCodeHighlight, syncPseudoHighlight } from "./node-highlight.js";
+import { GEN_MODES, buildIncrementalWorkflowPrompt, getGenModeMeta } from "./gen-modes.js";
 import { state, uid } from "./state.js";
 import { NODE_LAYOUT_HEIGHT, NODE_LAYOUT_WIDTH, WORLD_HEIGHT, WORLD_WIDTH, screenToUser } from "./viewport.js";
+
+const CODE_REPAIR_MAX_ROUNDS = 2;
 
 export function bindInteractions(elements, renderer) {
   const { setStatus, getSelectedNode, syncEditor, render, applyViewportTransform } = renderer;
@@ -31,7 +37,7 @@ export function bindInteractions(elements, renderer) {
 
   function createBlankWorkflow() {
     return {
-      mwgl_version: 2,
+      mwgl_version: 3,
       rule_id: uid("R_"),
       rule_name: "空白工作流",
       nodes: [],
@@ -74,10 +80,22 @@ export function bindInteractions(elements, renderer) {
     const cur = getActiveSession();
     const undoCount = Array.isArray(cur?.undoStack) ? cur.undoStack.length : 0;
     const redoCount = Array.isArray(cur?.redoStack) ? cur.redoStack.length : 0;
-    if (elements.btnUndoWorkflow) elements.btnUndoWorkflow.disabled = undoCount === 0;
-    if (elements.btnRedoWorkflow) elements.btnRedoWorkflow.disabled = redoCount === 0;
+    if (elements.btnUndoWorkflow) {
+      elements.btnUndoWorkflow.disabled = undoCount === 0;
+      elements.btnUndoWorkflow.title =
+        undoCount > 0
+          ? `后退一步（Ctrl+Z），还可后退 ${undoCount} 步`
+          : "暂无可后退的编辑";
+    }
+    if (elements.btnRedoWorkflow) {
+      elements.btnRedoWorkflow.disabled = redoCount === 0;
+      elements.btnRedoWorkflow.title =
+        redoCount > 0
+          ? `前进一步（Ctrl+Y / Cmd+Shift+Z），还可前进 ${redoCount} 步`
+          : "暂无可前进的编辑";
+    }
     if (elements.historyHint) {
-      elements.historyHint.textContent = `后退 ${undoCount} | 前进 ${redoCount}`;
+      elements.historyHint.textContent = `可后退 ${undoCount} · 可前进 ${redoCount}`;
     }
   }
 
@@ -103,31 +121,40 @@ export function bindInteractions(elements, renderer) {
 
   function undoWorkflowChange() {
     const cur = getActiveSession();
-    if (!cur || !Array.isArray(cur.undoStack) || cur.undoStack.length === 0) return;
+    if (!cur || !Array.isArray(cur.undoStack) || cur.undoStack.length === 0) {
+      setStatus("没有可后退的编辑记录。", true);
+      return;
+    }
     if (!Array.isArray(cur.redoStack)) cur.redoStack = [];
     const previous = cur.undoStack.pop();
     cur.redoStack.push(cloneWorkflowSnapshot());
     applyWorkflowSnapshot(previous);
     persistActiveSessionNow();
     updateHistoryButtons();
-    setStatus("已后退一步。");
+    setStatus(`已后退一步（还可后退 ${cur.undoStack.length} 步）。`);
   }
 
   function redoWorkflowChange() {
     const cur = getActiveSession();
-    if (!cur || !Array.isArray(cur.redoStack) || cur.redoStack.length === 0) return;
+    if (!cur || !Array.isArray(cur.redoStack) || cur.redoStack.length === 0) {
+      setStatus("没有可前进的编辑记录。", true);
+      return;
+    }
     if (!Array.isArray(cur.undoStack)) cur.undoStack = [];
     const next = cur.redoStack.pop();
     cur.undoStack.push(cloneWorkflowSnapshot());
     applyWorkflowSnapshot(next);
     persistActiveSessionNow();
     updateHistoryButtons();
-    setStatus("已前进一步。");
+    setStatus(`已前进一步（还可前进 ${cur.redoStack.length} 步）。`);
   }
 
   function saveCurrentSessionSnapshot() {
     const cur = sessions.find((s) => s.id === activeSessionId);
     if (!cur) return;
+    if (elements.sessionTitle) {
+      cur.name = String(elements.sessionTitle.value || "").trim() || cur.name;
+    }
     cur.prompt = elements.userPrompt.value || "";
     cur.workflow = cloneWorkflow(state.workflow);
     cur.pseudocode = elements.pseudocodeText.value || "";
@@ -144,12 +171,29 @@ export function bindInteractions(elements, renderer) {
     }
   }
 
-  function syncSessionSelect() {
-    const html = sessions
-      .map((s) => `<option value="${s.id}">${s.name}</option>`)
-      .join("");
-    elements.sessionSelect.innerHTML = html;
-    if (activeSessionId) elements.sessionSelect.value = activeSessionId;
+  function renderSessionList() {
+    const listEl = elements.sessionList;
+    if (!listEl) return;
+    listEl.innerHTML = "";
+    sessions.forEach((session) => {
+      const item = document.createElement("div");
+      item.className = `session-item${session.id === activeSessionId ? " active" : ""}`;
+      const name = document.createElement("span");
+      name.className = "session-name";
+      name.textContent = session.name;
+      name.addEventListener("click", () => switchSession(session.id));
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "session-delete";
+      del.title = "删除";
+      del.textContent = "×";
+      del.addEventListener("click", (e) => {
+        e.stopPropagation();
+        deleteSessionById(session.id);
+      });
+      item.append(name, del);
+      listEl.appendChild(item);
+    });
   }
 
   function applySession(session) {
@@ -157,6 +201,7 @@ export function bindInteractions(elements, renderer) {
     state.selectedNodeId = state.workflow.nodes[0]?.id || null;
     state.selectedEdgeId = null;
     state.pendingCenterViewport = true;
+    if (elements.sessionTitle) elements.sessionTitle.value = session.name || "";
     elements.userPrompt.value = session.prompt || "";
     elements.pseudocodeText.value = session.pseudocode || "";
     elements.codeText.value = session.code || "";
@@ -164,8 +209,11 @@ export function bindInteractions(elements, renderer) {
     elements.runResultText.value = session.runResult || "";
     state.pseudocode = session.pseudocode || "";
     state.code = session.code || "";
+    document.title = `${session.name || "工作流"} - MWGL Studio v3`;
     render();
+    renderSessionList();
     updateHistoryButtons();
+    syncGenModeUi();
   }
 
   function switchSession(nextId) {
@@ -175,9 +223,29 @@ export function bindInteractions(elements, renderer) {
     const target = sessions.find((s) => s.id === nextId);
     if (!target) return;
     applySession(target);
-    syncSessionSelect();
     persistSessions();
     setStatus(`已切换到${target.name}。`);
+  }
+
+  function deleteSessionById(sessionId) {
+    if (sessions.length <= 1) {
+      setStatus("至少保留一个工作流。", true);
+      return;
+    }
+    const target = sessions.find((s) => s.id === sessionId);
+    if (!target) return;
+    if (!confirm(`确定删除「${target.name}」吗？`)) return;
+    const wasActive = activeSessionId === sessionId;
+    sessions = sessions.filter((s) => s.id !== sessionId);
+    if (wasActive) {
+      activeSessionId = sessions[0].id;
+      applySession(sessions[0]);
+    } else {
+      renderSessionList();
+    }
+    persistSessions();
+    updateHistoryButtons();
+    setStatus(wasActive ? `已删除「${target.name}」。` : `已删除「${target.name}」。`);
   }
 
   function persistActiveSessionNow() {
@@ -209,15 +277,200 @@ export function bindInteractions(elements, renderer) {
       : [createSessionPayload(newSessionName(1))];
     activeSessionId = String(loaded?.activeSessionId || sessions[0].id);
     if (!sessions.some((s) => s.id === activeSessionId)) activeSessionId = sessions[0].id;
-    syncSessionSelect();
     applySession(sessions.find((s) => s.id === activeSessionId));
     persistSessions();
+  }
+
+  async function checkApiStatus() {
+    const indicator = document.getElementById("apiStatus");
+    const textEl = document.getElementById("apiStatusText");
+    if (!indicator || !textEl) return;
+    try {
+      const base = String(elements.apiBase?.value || "").trim().replace(/\/$/, "");
+      if (!base) throw new Error("未配置后端地址");
+      const res = await fetch(`${base}/api/health`);
+      const data = await res.json();
+      if (data.ok) {
+        indicator.className = "status-indicator online";
+        textEl.textContent = data.hasKey ? "API 已连接" : "未配置密钥";
+      } else {
+        throw new Error("API 异常");
+      }
+    } catch {
+      indicator.className = "status-indicator offline";
+      textEl.textContent = "连接失败";
+    }
+  }
+
+  function initTabs() {
+    document.querySelectorAll(".tab-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
+        document.querySelectorAll(".tab-content").forEach((c) => c.classList.remove("active"));
+        btn.classList.add("active");
+        const panel = document.getElementById(`tab-${btn.dataset.tab}`);
+        if (panel) panel.classList.add("active");
+        const tab = btn.dataset.tab;
+        if (tab === "pseudo") syncPseudoHighlight(elements, state.workflow);
+        if (tab === "code") syncCodeHighlight(elements, state.workflow);
+      });
+    });
+  }
+
+  function formatRunCheckResult(result) {
+    const checks = (result.checks || [])
+      .map((c) => `${c.ok ? "✓" : "✗"} ${c.name}: ${c.detail}`)
+      .join("\n");
+    return [
+      result.passed ? "【通过】运行检测成功" : "【未通过】运行检测失败",
+      `language: ${result.language}`,
+      `syntaxOk: ${result.syntaxOk}`,
+      `exitCode: ${result.exitCode}`,
+      "",
+      "检查项:",
+      checks || "(无)",
+      "",
+      "stdout:",
+      String(result.stdout || "").trim() || "(empty)",
+      "",
+      "stderr:",
+      String(result.stderr || "").trim() || "(empty)"
+    ].join("\n");
+  }
+
+  function updateRunCheckUI(result) {
+    if (elements.runCheckSummary) {
+      elements.runCheckSummary.classList.remove("hidden", "pass", "fail");
+      elements.runCheckSummary.classList.add(result.passed ? "pass" : "fail");
+      elements.runCheckSummary.textContent = result.passed
+        ? "运行检测通过：语法校验与执行均正常。"
+        : `运行检测未通过（退出码 ${result.exitCode}）。可查看日志或点击「根据报错修复」再次尝试。`;
+    }
+    if (elements.codeCheckBadge) {
+      elements.codeCheckBadge.classList.remove("hidden", "pass", "fail");
+      elements.codeCheckBadge.classList.add(result.passed ? "pass" : "fail");
+      elements.codeCheckBadge.textContent = result.passed ? "✓ 运行检测通过" : "✗ 运行检测未通过";
+    }
+  }
+
+  async function runCodeCheckAndReport({ silent = false } = {}) {
+    const base = elements.apiBase.value.trim().replace(/\/$/, "");
+    const code = elements.codeText.value.trim();
+    const language = elements.codeLanguage.value;
+    if (!code) {
+      if (!silent) setStatus("请先生成或输入代码。", true);
+      return null;
+    }
+    if (!silent) setStatus(`正在运行 ${language} 检测（语法 + 执行）...`);
+    try {
+      const result = await runCodeQuickCheck({ base, code, language });
+      const output = formatRunCheckResult(result);
+      elements.runResultText.value = output;
+      updateRunCheckUI(result);
+      saveCurrentSessionSnapshot();
+      persistSessions();
+      if (!silent) {
+        setStatus(
+          result.passed ? "运行检测通过。" : "运行检测未通过，请查看运行日志。",
+          !result.passed
+        );
+      }
+      return result;
+    } catch (error) {
+      if (!silent) setStatus(`运行检测失败：${error.message}`, true);
+      return null;
+    }
+  }
+
+  async function repairCodeOnce(checkResult, { round = 1, silent = false } = {}) {
+    const base = elements.apiBase.value.trim().replace(/\/$/, "");
+    const code = elements.codeText.value.trim();
+    const language = elements.codeLanguage.value;
+    const pseudocode = elements.pseudocodeText?.value?.trim() || "";
+    if (!code || !checkResult) return null;
+    if (!silent) {
+      setStatus(`正在根据报错修复代码（第 ${round}/${CODE_REPAIR_MAX_ROUNDS} 轮）...`);
+    }
+    const fixed = await repairCodeFromCheck({
+      base,
+      code,
+      language,
+      checkResult,
+      pseudocode,
+      round,
+      maxRounds: CODE_REPAIR_MAX_ROUNDS
+    });
+    state.code = fixed;
+    elements.codeText.value = fixed;
+    syncCodeHighlight(elements, state.workflow);
+    persistActiveSessionNow();
+    return fixed;
+  }
+
+  /** 检测未通过时自动把报错回传 LLM 修复，最多 CODE_REPAIR_MAX_ROUNDS 轮 */
+  async function runCodeCheckWithAutoRepair({ silent = false } = {}) {
+    let lastCheck = await runCodeCheckAndReport({ silent });
+    if (!lastCheck || lastCheck.passed) return lastCheck;
+
+    const base = elements.apiBase.value.trim().replace(/\/$/, "");
+    if (!base) return lastCheck;
+
+    for (let round = 1; round <= CODE_REPAIR_MAX_ROUNDS; round += 1) {
+      if (!silent) {
+        setStatus(`检测未通过，正在根据报错请 LLM 修复（${round}/${CODE_REPAIR_MAX_ROUNDS}）...`);
+      }
+      try {
+        await repairCodeOnce(lastCheck, { round, silent: true });
+      } catch (error) {
+        if (!silent) setStatus(`代码修复失败：${error.message}`, true);
+        return lastCheck;
+      }
+      lastCheck = await runCodeCheckAndReport({ silent: true });
+      if (!lastCheck) return lastCheck;
+      if (lastCheck.passed) {
+        if (!silent) setStatus(`修复后运行检测通过（第 ${round} 轮修复）。`);
+        return lastCheck;
+      }
+    }
+
+    if (!silent) {
+      setStatus(
+        `已尝试 ${CODE_REPAIR_MAX_ROUNDS} 轮自动修复，仍未通过检测，请查看运行日志或手动修改。`,
+        true
+      );
+    }
+    return lastCheck;
+  }
+
+  async function repairCodeFromLastFailure() {
+    if (!elements.codeText.value.trim()) {
+      return setStatus("请先生成或输入代码。", true);
+    }
+    await runCodeCheckWithAutoRepair();
+    document.querySelector('.tab-btn[data-tab="log"]')?.click();
   }
 
   const selectPostOptimizeEl = document.getElementById("selectPostOptimize");
   const selectTop4SearchModeEl = document.getElementById("selectTop4SearchMode");
   const optimizeHintEl = document.getElementById("optimizeHint");
-  const chkContextModeEl = document.getElementById("chkContextMode");
+  const humanReviewPanelEl = document.getElementById("humanReviewPanel");
+  const humanReviewPhase1El = document.getElementById("humanReviewPhase1");
+  const humanReviewPhase2El = document.getElementById("humanReviewPhase2");
+  const humanReviewLeadEl = document.getElementById("humanReviewLead");
+  const humanReviewListEl = document.getElementById("humanReviewList");
+  const humanReviewFinalInputEl = document.getElementById("humanReviewFinalInput");
+  const hrStep1BadgeEl = document.getElementById("hrStep1Badge");
+  const hrStep2BadgeEl = document.getElementById("hrStep2Badge");
+  const btnFinishInitialEditEl = document.getElementById("btnFinishInitialEdit");
+  const btnContinueOptimizeEl = document.getElementById("btnContinueOptimize");
+  const humanReviewToolbarEl = document.getElementById("humanReviewToolbar");
+  const humanReviewToolbarLabelEl = document.getElementById("humanReviewToolbarLabel");
+  const btnFinishInitialEditToolbarEl = document.getElementById("btnFinishInitialEditToolbar");
+  const btnContinueOptimizeToolbarEl = document.getElementById("btnContinueOptimizeToolbar");
+  const selectGenModeEl = document.getElementById("selectGenMode");
+  const genModeHintEl = document.getElementById("genModeHint");
+  let pendingTop2Optimize = null;
+  let humanReviewPhase = null;
 
   function syncOptimizeUi() {
     const enabled = selectPostOptimizeEl?.value === "top4";
@@ -231,8 +484,173 @@ export function bindInteractions(elements, renderer) {
     }
     const mcts = selectTop4SearchModeEl?.value === "mcts";
     optimizeHintEl.textContent = mcts
-      ? "Top-4 + MCTS：DeepSeek 初池 8→4；每轮 UCT 选父代，Qwen 并行「内容」「结构」两路（约 3 轮，需 QWEN_*）。返回全程最高分。"
-      : "Top-4 + 束搜索：DeepSeek 初池 8→4；每轮对 top4 全扩，每图 Qwen「内容」「结构」两路（约 2 轮，需 QWEN_*）。返回全程最高分。";
+      ? "Top-2：重新生成工作流后须 ① 初次修改 → ② 最终确认，再补初稿并 MCTS（需 QWEN_*）。"
+      : "Top-2：重新生成工作流后须 ① 初次修改 → ② 最终确认，再补初稿并束搜索（需 QWEN_*）。";
+  }
+
+  function syncHumanReviewToolbar(phase) {
+    const active = humanReviewPanelEl && !humanReviewPanelEl.classList.contains("hidden");
+    humanReviewToolbarEl?.classList.toggle("hidden", !active);
+    if (!active) return;
+    const isInitial = phase === "initial";
+    btnFinishInitialEditToolbarEl?.classList.toggle("hidden", !isInitial);
+    btnContinueOptimizeToolbarEl?.classList.toggle("hidden", isInitial);
+    if (humanReviewToolbarLabelEl) {
+      humanReviewToolbarLabelEl.textContent = isInitial
+        ? "Top-2 · ① 改完画布点「确认初次修改」"
+        : "Top-2 · ② 填意见后点「开始 Top-2」";
+    }
+  }
+
+  function setHumanReviewStepUi(phase) {
+    humanReviewPhase = phase;
+    hrStep1BadgeEl?.classList.toggle("hr-step-active", phase === "initial");
+    hrStep1BadgeEl?.classList.toggle("hr-step-done", phase === "confirm");
+    hrStep2BadgeEl?.classList.toggle("hr-step-active", phase === "confirm");
+    hrStep2BadgeEl?.classList.toggle("hr-step-done", false);
+    humanReviewPhase1El?.classList.toggle("hidden", phase !== "initial");
+    humanReviewPhase2El?.classList.toggle("hidden", phase !== "confirm");
+    syncHumanReviewToolbar(phase);
+  }
+
+  function hideHumanReviewPanel() {
+    pendingTop2Optimize = null;
+    humanReviewPhase = null;
+    humanReviewPanelEl?.classList.add("hidden");
+    humanReviewToolbarEl?.classList.add("hidden");
+    if (humanReviewListEl) humanReviewListEl.innerHTML = "";
+    if (humanReviewFinalInputEl) humanReviewFinalInputEl.value = "";
+    setHumanReviewStepUi("initial");
+  }
+
+  function buildOptimizePrompt(originalPrompt, finalNotes) {
+    const base = String(originalPrompt || "").trim();
+    const notes = String(finalNotes || "").trim();
+    if (!notes) return base || "MWGL 工作流优化";
+    if (!base) return notes;
+    return `${base}\n\n【用户对首图的最终补充意见】\n${notes}`;
+  }
+
+  function showHumanReviewPhaseInitial() {
+    if (!humanReviewPanelEl) return;
+    humanReviewPanelEl.classList.remove("hidden");
+    setHumanReviewStepUi("initial");
+    requestAnimationFrame(() => {
+      humanReviewPanelEl.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    });
+  }
+
+  function renderHumanReviewReferenceList(data) {
+    if (!humanReviewListEl) return;
+    humanReviewListEl.innerHTML = "";
+    const items = (data?.items || []).filter((x) => x.kind !== "intro");
+    if (!items.length) {
+      const li = document.createElement("li");
+      li.textContent = "暂无额外参考项。";
+      humanReviewListEl.appendChild(li);
+      return;
+    }
+    for (const item of items) {
+      const li = document.createElement("li");
+      li.textContent = item.text;
+      humanReviewListEl.appendChild(li);
+    }
+  }
+
+  async function loadHumanReviewSuggestions(workflow, prompt, base) {
+    try {
+      const evalDataset = await fetchEvalDataset({ base });
+      const data = await fetchWorkflowSuggestions({
+        base,
+        workflow,
+        prompt,
+        evalDataset
+      });
+      renderHumanReviewReferenceList(data);
+    } catch (err) {
+      renderHumanReviewReferenceList({
+        items: [{ kind: "warn", text: `参考项加载失败：${String(err.message || err)}` }]
+      });
+    }
+  }
+
+  async function finishInitialEditPhase() {
+    if (!pendingTop2Optimize) return;
+    const { base, prompt } = pendingTop2Optimize;
+    const errs = constraintErrors(state.workflow);
+    if (errs.length) {
+      return setStatus(
+        `请先修复约束错误再进入最终确认：${formatConstraintErrors(errs)}`,
+        true
+      );
+    }
+    setHumanReviewStepUi("confirm");
+    if (humanReviewFinalInputEl) humanReviewFinalInputEl.value = "";
+    humanReviewPanelEl?.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
+    loadHumanReviewSuggestions(state.workflow, prompt, base);
+    setStatus(
+      "【第二步】在画布上方蓝条填写补充意见，点击「确认意见并开始 Top-2」（或工具栏「开始 Top-2」）。",
+      false
+    );
+  }
+
+  function startHumanReviewAfterGenerate(workflow, prompt, base, searchMode) {
+    pendingTop2Optimize = { base, prompt, searchMode, originalPrompt: prompt };
+    showHumanReviewPhaseInitial();
+    setStatus(
+      "首图已生成。① 在画布改图 → 点蓝条或工具栏绿色「确认初次修改」；② 填意见 → 点「确认意见并开始 Top-2」。",
+      false
+    );
+  }
+
+  async function continueTop2Optimize() {
+    if (!pendingTop2Optimize) return;
+    if (humanReviewPhase !== "confirm") {
+      return setStatus("请先完成「初次修改」并进入「最终确认」。", true);
+    }
+    const { base, prompt, searchMode, originalPrompt } = pendingTop2Optimize;
+    const finalNotes = humanReviewFinalInputEl?.value?.trim() || "";
+    const optimizePrompt = buildOptimizePrompt(originalPrompt || prompt, finalNotes);
+    const modeLabel = searchMode === "mcts" ? "MCTS" : "束搜索";
+    const errs = constraintErrors(state.workflow);
+    if (errs.length) {
+      return setStatus(
+        `请先修复约束错误再继续 Top-2：${formatConstraintErrors(errs)}`,
+        true
+      );
+    }
+    hideHumanReviewPanel();
+    setStatus(`正在 Top-2 ${modeLabel}（以当前图为种子，补 3 张初稿并搜索，需 Qwen）...`);
+    try {
+      const evalDataset = await fetchEvalDataset({ base });
+      const workflow = await optimizeWorkflow({
+        base,
+        workflow: state.workflow,
+        prompt: optimizePrompt,
+        evalDataset,
+        top4SearchMode: searchMode
+      });
+      recordWorkflowCheckpoint();
+      state.workflow = workflow;
+      state.selectedNodeId = state.workflow.nodes[0]?.id || null;
+      state.selectedEdgeId = null;
+      state.pendingCenterViewport = true;
+      render();
+      persistActiveSessionNow();
+      const afterErrs = constraintErrors(workflow);
+      const notesHint = finalNotes ? "（已纳入你的补充意见）" : "";
+      const msg = afterErrs.length
+        ? `Top-2 已完成${notesHint}（草稿态）：${formatConstraintErrors(afterErrs)}`
+        : `Top-2 优化已完成并更新画布${notesHint}。`;
+      setStatus(msg, Boolean(afterErrs.length));
+      if (finalNotes && elements.userPrompt) {
+        elements.userPrompt.value = optimizePrompt;
+        saveCurrentSessionSnapshot();
+        persistSessions();
+      }
+    } catch (optErr) {
+      setStatus(`Top-2 ${modeLabel} 失败：${optErr.message}`, true);
+    }
   }
 
   if (selectPostOptimizeEl) {
@@ -248,6 +666,7 @@ export function bindInteractions(elements, renderer) {
     selectPostOptimizeEl.addEventListener("change", () => {
       localStorage.setItem("mwgl_post_optimize", selectPostOptimizeEl.value);
       syncOptimizeUi();
+      syncGenModeUi();
     });
   }
   if (selectTop4SearchModeEl) {
@@ -261,47 +680,46 @@ export function bindInteractions(elements, renderer) {
     });
   }
   syncOptimizeUi();
-  if (chkContextModeEl) {
-    const saved = localStorage.getItem("mwgl_context_mode");
-    if (saved !== null) chkContextModeEl.checked = saved === "1";
-    chkContextModeEl.addEventListener("change", () => {
-      localStorage.setItem("mwgl_context_mode", chkContextModeEl.checked ? "1" : "0");
-    });
+
+  function getGenMode() {
+    const v = selectGenModeEl?.value;
+    return v && GEN_MODES[v] ? v : "regen_workflow";
   }
 
-  function buildContextAwarePrompt(prompt) {
-    const useContext = Boolean(chkContextModeEl?.checked);
-    if (!useContext) return { effectivePrompt: prompt, usedContext: false };
-
-    const contextWorkflow = state.workflow;
-    const hasWorkflowContext = Array.isArray(contextWorkflow?.nodes) && contextWorkflow.nodes.length > 0;
-    const previousPrompt = String(localStorage.getItem("mwgl_last_user_prompt") || "").trim();
-    if (!hasWorkflowContext && !previousPrompt) {
-      return { effectivePrompt: prompt, usedContext: false };
+  function syncGenModeUi() {
+    const mode = getGenMode();
+    const meta = getGenModeMeta(mode);
+    if (genModeHintEl) {
+      genModeHintEl.textContent = meta.hint;
     }
-
-    const contextChunks = [];
-    if (previousPrompt) {
-      contextChunks.push(`上一轮用户输入：\n${previousPrompt}`);
+    const btnGen = document.getElementById("btnGenerate");
+    if (btnGen) {
+      btnGen.textContent = `🚀 ${meta.label}`;
     }
-    if (hasWorkflowContext) {
-      contextChunks.push(
-        `当前已生成工作流 JSON（请在此基础上做增量修改，不要完全重写）：\n${JSON.stringify(
-          contextWorkflow,
-          null,
-          2
-        )}`
-      );
+  }
+
+  if (selectGenModeEl) {
+    const savedMode = localStorage.getItem("mwgl_gen_mode");
+    if (savedMode && GEN_MODES[savedMode]) selectGenModeEl.value = savedMode;
+    selectGenModeEl.addEventListener("change", () => {
+      localStorage.setItem("mwgl_gen_mode", selectGenModeEl.value);
+      syncGenModeUi();
+    });
+  }
+  syncGenModeUi();
+
+  function requireGenModeTarget(target, actionLabel) {
+    const mode = getGenMode();
+    const meta = getGenModeMeta(mode);
+    if (meta.target !== target) {
+      setStatus(`当前方式为「${meta.label}」，请切换操作方式或点击对应按钮。`, true);
+      return false;
     }
+    return true;
+  }
 
-    const effectivePrompt = [
-      "你现在处于 MWGL 增量修改模式。",
-      ...contextChunks,
-      `本轮新增修改需求：\n${prompt}`,
-      "请尽量复用原有节点/边与 ID，仅在必要处增删改。输出完整可校验的 MWGL JSON。"
-    ].join("\n\n");
-
-    return { effectivePrompt, usedContext: true };
+  function getRevisionNotes() {
+    return elements.userPrompt.value.trim();
   }
 
   function constraintErrors(workflow) {
@@ -563,14 +981,27 @@ export function bindInteractions(elements, renderer) {
   }
 
   async function callDeepSeekAndBuildWorkflow() {
-    const prompt = elements.userPrompt.value.trim();
-    const base = elements.apiBase.value.trim().replace(/\/$/, "");
+    if (!requireGenModeTarget("workflow")) return;
 
-    if (!prompt) return setStatus("请先输入业务描述。", true);
-    const { effectivePrompt, usedContext } = buildContextAwarePrompt(prompt);
+    const prompt = getRevisionNotes();
+    const base = elements.apiBase.value.trim().replace(/\/$/, "");
+    const mode = getGenMode();
+    const meta = getGenModeMeta(mode);
+
+    if (!prompt) return setStatus("请先输入业务描述或修改意见。", true);
+
+    const postOpt = selectPostOptimizeEl?.value || "none";
+    if (postOpt === "top4" && !meta.incremental) {
+      setStatus("Top-2：将重新生成首图，并须完成「初次修改」→「最终确认」后才能搜索。", false);
+    }
+
+    const previousPrompt = String(localStorage.getItem("mwgl_last_user_prompt") || "").trim();
+    const effectivePrompt = meta.incremental
+      ? buildIncrementalWorkflowPrompt(prompt, state.workflow, previousPrompt)
+      : prompt;
 
     localStorage.setItem("mwgl_api_base", base);
-    setStatus(usedContext ? "正在调用 DeepSeek（上下文增量模式）..." : "正在调用 DeepSeek...");
+    setStatus(`正在${meta.label}…`);
 
     try {
       let workflow = await buildWorkflowByDeepSeek({ base, prompt: effectivePrompt });
@@ -581,24 +1012,19 @@ export function bindInteractions(elements, renderer) {
       let optTail = "";
       if (postOpt === "top4") {
         const searchMode = selectTop4SearchModeEl?.value === "mcts" ? "mcts" : "beam";
-        const modeLabel = searchMode === "mcts" ? "MCTS" : "束搜索";
-        setStatus(`DeepSeek 已完成，正在进行 Top-4 ${modeLabel} 优化（内容/结构双分支，需 Qwen）...`);
-        try {
-          const evalDataset = await fetchEvalDataset({ base });
-          workflow = await optimizeWorkflow({
-            base,
-            workflow,
-            prompt,
-            evalDataset,
-            top4SearchMode: searchMode
-          });
-          optDone = true;
-          optTail = `（已做 Top-4 ${modeLabel} 优化）`;
-        } catch (optErr) {
-          optFail = ` Top-4 ${modeLabel} 优化失败（已保留 DeepSeek 结果）：${optErr.message}`;
-        }
+        localStorage.setItem("mwgl_last_user_prompt", prompt);
+        recordWorkflowCheckpoint();
+        state.workflow = workflow;
+        state.selectedNodeId = state.workflow.nodes[0]?.id || null;
+        state.selectedEdgeId = null;
+        state.pendingCenterViewport = true;
+        render();
+        persistActiveSessionNow();
+        startHumanReviewAfterGenerate(workflow, prompt, base, searchMode);
+        return;
       }
 
+      hideHumanReviewPanel();
       recordWorkflowCheckpoint();
       state.workflow = workflow;
       localStorage.setItem("mwgl_last_user_prompt", prompt);
@@ -620,20 +1046,30 @@ export function bindInteractions(elements, renderer) {
   }
 
   async function callDeepSeekForPseudocode() {
+    if (!requireGenModeTarget("pseudo")) return;
+
     const base = elements.apiBase.value.trim().replace(/\/$/, "");
     const workflow = state.workflow;
+    const meta = getGenModeMeta(getGenMode());
 
     if (!workflow || !workflow.nodes || !workflow.nodes.length) {
       return setStatus("当前没有可转换的工作流。", true);
     }
 
     localStorage.setItem("mwgl_api_base", base);
-    setStatus("正在调用 DeepSeek 生成伪代码...");
+    setStatus(`正在${meta.label}…`);
 
     try {
-      const pseudocode = await dagToPseudocode({ base, workflow });
+      const pseudocode = await dagToPseudocode({
+        base,
+        workflow,
+        mode: meta.incremental ? "incremental" : "regen",
+        existingPseudocode: meta.incremental ? elements.pseudocodeText.value : "",
+        revisionNotes: getRevisionNotes()
+      });
       state.pseudocode = pseudocode;
       elements.pseudocodeText.value = pseudocode;
+      syncPseudoHighlight(elements, workflow);
       persistActiveSessionNow();
       setStatus("已生成伪代码。");
     } catch (error) {
@@ -642,55 +1078,54 @@ export function bindInteractions(elements, renderer) {
   }
 
   async function callDeepSeekForCode() {
+    if (!requireGenModeTarget("code")) return;
+
     const base = elements.apiBase.value.trim().replace(/\/$/, "");
     const pseudocode = elements.pseudocodeText.value.trim();
     const language = elements.codeLanguage.value;
+    const meta = getGenModeMeta(getGenMode());
 
     if (!pseudocode) {
       return setStatus("请先生成或输入伪代码。", true);
     }
 
     localStorage.setItem("mwgl_api_base", base);
-    setStatus(`正在调用 DeepSeek 生成 ${language} 代码...`);
+    setStatus(`正在${meta.label}（${language}）…`);
 
     try {
-      const code = await pseudoToCode({ base, pseudocode, language });
+      const code = await pseudoToCode({
+        base,
+        pseudocode,
+        language,
+        workflow: state.workflow,
+        mode: meta.incremental ? "incremental" : "regen",
+        existingCode: meta.incremental ? elements.codeText.value : "",
+        revisionNotes: getRevisionNotes()
+      });
       state.code = code;
       elements.codeText.value = code;
+      syncCodeHighlight(elements, state.workflow);
       persistActiveSessionNow();
-      setStatus(`已生成 ${language} 代码。`);
+      setStatus(`已生成 ${language} 代码，正在运行检测（失败将自动修复）...`);
+      const check = await runCodeCheckWithAutoRepair({ silent: true });
+      if (check?.passed) {
+        setStatus(`已生成 ${language} 代码，运行检测通过。`);
+      } else if (check) {
+        setStatus(
+          `已生成 ${language} 代码，经自动修复后仍未通过检测（见运行日志，可点「根据报错修复」）。`,
+          true
+        );
+      } else {
+        setStatus(`已生成 ${language} 代码，运行检测调用失败。`, true);
+      }
     } catch (error) {
       setStatus(`代码生成失败：${error.message}`, true);
     }
   }
 
   async function runQuickCheck() {
-    const base = elements.apiBase.value.trim().replace(/\/$/, "");
-    const code = elements.codeText.value.trim();
-    const language = elements.codeLanguage.value;
-    if (!code) {
-      return setStatus("请先生成或输入代码。", true);
-    }
-    setStatus(`正在运行 ${language} 快速自检...`);
-    try {
-      const result = await runCodeQuickCheck({ base, code, language });
-      const output = [
-        `language: ${result.language}`,
-        `exitCode: ${result.exitCode}`,
-        "",
-        "stdout:",
-        String(result.stdout || "").trim() || "(empty)",
-        "",
-        "stderr:",
-        String(result.stderr || "").trim() || "(empty)"
-      ].join("\n");
-      elements.runResultText.value = output;
-      saveCurrentSessionSnapshot();
-      persistSessions();
-      setStatus(result.exitCode === 0 ? "快速自检完成（退出码 0）。" : "快速自检完成（存在报错）。", result.exitCode !== 0);
-    } catch (error) {
-      setStatus(`快速自检失败：${error.message}`, true);
-    }
+    await runCodeCheckWithAutoRepair();
+    document.querySelector('.tab-btn[data-tab="log"]')?.click();
   }
 
   const loopEditor = createLoopEditor({
@@ -987,8 +1422,24 @@ export function bindInteractions(elements, renderer) {
     }, { passive: false });
   }
 
+  async function executeCurrentGenMode() {
+    const mode = getGenMode();
+    const meta = getGenModeMeta(mode);
+    if (meta.target === "workflow") {
+      await callDeepSeekAndBuildWorkflow();
+    } else if (meta.target === "pseudo") {
+      await callDeepSeekForPseudocode();
+    } else if (meta.target === "code") {
+      await callDeepSeekForCode();
+    }
+  }
+
   function bindActions() {
-    document.getElementById("btnGenerate").addEventListener("click", callDeepSeekAndBuildWorkflow);
+    document.getElementById("btnGenerate").addEventListener("click", executeCurrentGenMode);
+    btnFinishInitialEditEl?.addEventListener("click", finishInitialEditPhase);
+    btnContinueOptimizeEl?.addEventListener("click", continueTop2Optimize);
+    btnFinishInitialEditToolbarEl?.addEventListener("click", finishInitialEditPhase);
+    btnContinueOptimizeToolbarEl?.addEventListener("click", continueTop2Optimize);
     document.getElementById("btnParseMwgl").addEventListener("click", () => {
       try {
         const workflow = mwglToWorkflow(elements.mwglText.value);
@@ -1022,6 +1473,7 @@ export function bindInteractions(elements, renderer) {
 
     document.getElementById("btnGenCode").addEventListener("click", callDeepSeekForCode);
     document.getElementById("btnRunCode").addEventListener("click", runQuickCheck);
+    document.getElementById("btnRepairCode")?.addEventListener("click", repairCodeFromLastFailure);
     if (elements.btnUndoWorkflow) {
       elements.btnUndoWorkflow.addEventListener("click", undoWorkflowChange);
     }
@@ -1029,44 +1481,48 @@ export function bindInteractions(elements, renderer) {
       elements.btnRedoWorkflow.addEventListener("click", redoWorkflowChange);
     }
 
-    elements.sessionSelect.addEventListener("change", () => {
-      switchSession(elements.sessionSelect.value);
-    });
-    elements.btnNewSession.addEventListener("click", () => {
-      saveCurrentSessionSnapshot();
-      const next = createSessionPayload(newSessionName(sessions.length + 1));
-      sessions.push(next);
-      activeSessionId = next.id;
-      syncSessionSelect();
-      applySession(next);
-      persistSessions();
-      updateHistoryButtons();
-      setStatus(`已新建${next.name}。`);
-    });
-    elements.btnDeleteSession.addEventListener("click", () => {
-      if (sessions.length <= 1) return setStatus("至少保留一个会话窗口。", true);
-      const deleting = sessions.find((s) => s.id === activeSessionId);
-      sessions = sessions.filter((s) => s.id !== activeSessionId);
-      activeSessionId = sessions[0].id;
-      syncSessionSelect();
-      applySession(sessions[0]);
-      persistSessions();
-      updateHistoryButtons();
-      setStatus(`已删除${deleting?.name || "当前窗口"}。`);
-    });
+    const newSessionBtn = document.getElementById("btnNewSession");
+    if (newSessionBtn) {
+      newSessionBtn.addEventListener("click", () => {
+        saveCurrentSessionSnapshot();
+        const next = createSessionPayload(`工作流 ${sessions.length + 1}`);
+        sessions.unshift(next);
+        activeSessionId = next.id;
+        applySession(next);
+        persistSessions();
+        updateHistoryButtons();
+        setStatus(`已新建${next.name}。`);
+      });
+    }
+    if (elements.sessionTitle) {
+      elements.sessionTitle.addEventListener("input", () => {
+        saveCurrentSessionSnapshot();
+        renderSessionList();
+        persistSessions();
+      });
+    }
+    if (elements.apiBase) {
+      elements.apiBase.addEventListener("change", () => {
+        localStorage.setItem("mwgl_api_base", elements.apiBase.value);
+        checkApiStatus();
+      });
+    }
 
     elements.userPrompt.addEventListener("input", () => {
       saveCurrentSessionSnapshot();
       persistSessions();
     });
     elements.pseudocodeText.addEventListener("input", () => {
+      syncPseudoHighlight(elements, state.workflow);
       saveCurrentSessionSnapshot();
       persistSessions();
     });
     elements.codeText.addEventListener("input", () => {
+      syncCodeHighlight(elements, state.workflow);
       saveCurrentSessionSnapshot();
       persistSessions();
     });
+    bindHighlightScroll(elements);
     elements.codeLanguage.addEventListener("change", () => {
       saveCurrentSessionSnapshot();
       persistSessions();
@@ -1118,4 +1574,10 @@ export function bindInteractions(elements, renderer) {
   bindActions();
   bindCanvasEvents();
   bindEdgeEvents();
+  initTabs();
+  checkApiStatus();
+  setInterval(() => {
+    saveCurrentSessionSnapshot();
+    persistSessions();
+  }, 3000);
 }

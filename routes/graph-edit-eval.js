@@ -24,7 +24,7 @@ router.get("/api/mwgl/graph-edit-eval/status", (_req, res) => {
       MWGL_PYTHON_BIN: process.env.MWGL_PYTHON_BIN ?? "python3"
     },
     notes:
-      "需克隆 RobustFlow 并 pip install -r tools/requirements-graph-edit.txt；默认 MWGL_GRAPH_EDIT_EVAL 未开启。"
+      "需克隆 RobustFlow 并 pip install -r tools/requirements-graph-edit.txt；默认已开启图编辑打分（MWGL_GRAPH_EDIT_EVAL=0 可关闭）。"
   });
 });
 

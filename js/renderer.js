@@ -1,5 +1,7 @@
 import { state } from "./state.js";
 import { workflowToMwgl } from "./mwgl.js";
+import { buildLoopPreviewHtml } from "./loop-preview.js";
+import { syncCodeHighlight, syncPseudoHighlight } from "./node-highlight.js";
 import {
   NODE_LAYOUT_HEIGHT,
   NODE_LAYOUT_WIDTH,
@@ -9,6 +11,14 @@ import {
   offsetToCenterBBox,
   workflowBBox
 } from "./viewport.js";
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
 
 export function createRenderer(elements) {
   const SVG_NS = "http://www.w3.org/2000/svg";
@@ -386,10 +396,15 @@ export function createRenderer(elements) {
       div.style.left = `${WORLD_WIDTH / 2 + node.x}px`;
       div.style.top = `${WORLD_HEIGHT / 2 + node.y}px`;
       div.dataset.id = node.id;
+      const loopPreview = node.loop ? buildLoopPreviewHtml(node.loop) : "";
+      const mainText = node.loop
+        ? `<div class="text node-text-main">${escapeHtml(node.text)}</div>`
+        : `<div class="text">${escapeHtml(node.text)}</div>`;
       div.innerHTML = `
         <button class="node-delete" type="button" title="删除节点" aria-label="删除节点">×</button>
-        <div class="type">${node.loop ? `${node.type} · ${node.loop.kind || "for"}` : node.type}</div>
-        <div class="text">${node.text}</div>
+        <div class="type">${node.loop ? `${node.type} · 循环` : node.type}</div>
+        ${mainText}
+        ${loopPreview}
       `;
       worldEl.appendChild(div);
     });
@@ -435,6 +450,8 @@ export function createRenderer(elements) {
       }
     }
     applyViewportTransform();
+    syncPseudoHighlight(elements, wf);
+    syncCodeHighlight(elements, wf);
   }
 
   let lastCanvasSize = { w: 0, h: 0 };

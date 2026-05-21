@@ -9,7 +9,9 @@ import optimize from "./routes/optimize.js";
 import mockEvaluator from "./routes/mock-evaluator.js";
 import evalDatasetRead from "./routes/eval-dataset-read.js";
 import runCheck from "./routes/run-check.js";
+import codeRepair from "./routes/code-repair.js";
 import graphEditEval from "./routes/graph-edit-eval.js";
+import workflowSuggestions from "./routes/workflow-suggestions.js";
 
 const app = express();
 const port = Number(process.env.PORT || 3001);
@@ -30,7 +32,9 @@ app.use(optimize);
 app.use(mockEvaluator);
 app.use(evalDatasetRead);
 app.use(runCheck);
+app.use(codeRepair);
 app.use(graphEditEval);
+app.use(workflowSuggestions);
 
 app.listen(port, () => {
   console.log(`MWGL v2 server listening on http://localhost:${port}`);

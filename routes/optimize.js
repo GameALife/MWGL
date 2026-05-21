@@ -40,12 +40,12 @@ const DEFAULT_CONFIG = {
   weights: { ...DEFAULT_SCORE_WEIGHTS },
   /** beam（默认）| mcts */
   top4_search_mode: "beam",
-  top4_keep: 4,
+  top4_keep: 2,
   top4_rounds: 2,
   /** 仅 mcts：在 top4_rounds 之后再扩展的轮数 */
   top4_mcts_extra_rounds: 1,
   top4_mcts_exploration: 1.2,
-  top4_initial_pool: 8,
+  top4_initial_pool: 4,
   /** 固定 2：内容 + 结构双分支（见 MUTATION_BRANCHES） */
   top4_children_per_parent: 2
 };
@@ -518,7 +518,7 @@ function buildGenerateUserPayload(context, expandCfg, parentWorkflow, maxNodes, 
     relevant_operators: ops,
     operator_hints: ops.map((id) => ({
       id,
-      purpose_zh: OPERATOR_SEMANTICS_ZH[id] || ""
+      purpose_zh: MUTATION_SEMANTICS_ZH[id] || ""
     })),
     output_requirement_zh:
       "模型回复正文只能是单个 MWGL v2 工作流 JSON 对象（mwgl_version,nodes,edges 等），禁止 markdown、禁止代码围栏、禁止任何额外说明。",
@@ -716,7 +716,7 @@ async function mutateWorkflowViaLlm(parentWorkflow, maxNodes, context) {
                 available_operators: availableOps,
                 operator_meanings: availableOps.map((id) => ({
                   id,
-                  purpose_zh: OPERATOR_SEMANTICS_ZH[id] || ""
+                  purpose_zh: MUTATION_SEMANTICS_ZH[id] || ""
                 })),
                 output_requirement_zh: "仅输出一个 JSON 对象，禁止 markdown 与任何附加说明。"
               })
@@ -950,6 +950,7 @@ function applyGraphEditToEvaluation(local, workflow, context) {
     details: {
       ...(local.details || {}),
       graph_edit_mode: scored.mode,
+      graph_edit_reference: ge.referenceKind === "parent" ? "parent" : "seed",
       graph_edit_fallback: Boolean(scored.fallback),
       graph_edit_local_score: local.score
     }
@@ -1139,8 +1140,10 @@ router.post("/api/mwgl/optimize", async (req, res) => {
       (x) => x.workflow
     );
 
-    if (context.graphEditEval?.enabled && !context.graphEditEval.referenceWorkflow && top4Seeds.length > 0) {
-      context.graphEditEval.referenceWorkflow = top4Seeds[0];
+    if (context.graphEditEval?.enabled && top4Seeds.length > 0) {
+      const seedRef = context.graphEditEval.referenceWorkflow || top4Seeds[0];
+      context.graphEditEval.seedReference = seedRef;
+      context.graphEditEval.referenceWorkflow = seedRef;
     }
 
     const runResult = await runTop4Search({
@@ -1223,7 +1226,8 @@ router.post("/api/mwgl/optimize", async (req, res) => {
         global_best_id: runResult.best?.id ?? null,
         top4: {
           dropped: runResult.dropped,
-          final_pool: runResult.pool?.length,
+          final_pool: runResult.pool?.length ?? 0,
+          final_tree_top: runResult.tree_top?.length ?? 0,
           mcts: runResult.mcts
         }
       },

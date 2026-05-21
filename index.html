@@ -7,198 +7,347 @@
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
-  <div class="app">
-    <div class="panel">
+  <!-- 顶部全局导航栏 -->
+  <header class="top-nav">
+    <div class="nav-left">
       <h1>MWGL Studio <span class="ver">v3</span></h1>
-      <p class="desc">
-        <strong>MWGL v3</strong>：主图仅 <code>start</code> / <code>step</code> / <code>branch</code> / <code>end</code>（DAG）。<code>for</code> 循环用 <code>step.loop.steps</code> 树 + 可选 <code>subworkflows</code>；点击带 ↻ 的节点编辑循环体，支持嵌套 for。
-      </p>
+      <p class="nav-desc">自然语言 → DAG工作流 → 可执行代码</p>
     </div>
+    <div class="nav-right">
+      <button id="btnSettings">⚙️ 设置</button>
+      <button id="btnImport">📥 导入</button>
+      <button id="btnExportAll">📤 导出全部</button>
+    </div>
+  </header>
 
-    <div class="panel inputs">
-      <div class="session-bar">
-        <label for="sessionSelect">会话窗口</label>
-        <div class="toolbar">
-          <select id="sessionSelect"></select>
-          <button id="btnUndoWorkflow" type="button" title="后退（Ctrl/Cmd+Z）">后退</button>
-          <button id="btnRedoWorkflow" type="button" title="前进（Ctrl/Cmd+Y 或 Shift+Ctrl/Cmd+Z）">前进</button>
-          <span id="historyHint" class="history-hint">后退 0 | 前进 0</span>
-          <button id="btnNewSession" type="button">新建窗口</button>
-          <button id="btnDeleteSession" type="button" class="btn-danger">删除窗口</button>
+  <div class="main-container">
+    <!-- 左侧：多窗口会话侧边栏（核心） -->
+    <aside class="sidebar-left">
+      <button id="btnNewSession" class="btn-new-session">+ 新建工作流</button>
+      <div class="session-list" id="sessionList"></div>
+      <div class="sidebar-footer">
+        <div class="status-indicator" id="apiStatus">
+          <span class="status-dot"></span>
+          <span id="apiStatusText">连接中...</span>
         </div>
       </div>
-      <div>
-        <div>
-          <label for="apiBase">后端代理 Base URL</label>
-          <input id="apiBase" value="http://localhost:3001" />
+    </aside>
+
+    <!-- 中间：核心工作区 -->
+    <main class="main-content">
+      <!-- 顶部输入与工具栏 -->
+      <div class="input-section">
+        <div class="session-header">
+          <input type="text" id="sessionTitle" class="session-title" placeholder="工作流名称" />
+          <div class="history-toolbar" role="group" aria-label="画布编辑历史">
+            <button
+              id="btnUndoWorkflow"
+              type="button"
+              class="btn-history btn-history-undo"
+              disabled
+              aria-label="后退一步"
+              title="后退一步（Ctrl+Z / Cmd+Z）"
+            >
+              <span class="btn-history-icon" aria-hidden="true">↩</span>
+              <span class="btn-history-text">后退</span>
+            </button>
+            <button
+              id="btnRedoWorkflow"
+              type="button"
+              class="btn-history btn-history-redo"
+              disabled
+              aria-label="前进一步"
+              title="前进一步（Ctrl+Y / Cmd+Shift+Z）"
+            >
+              <span class="btn-history-icon" aria-hidden="true">↪</span>
+              <span class="btn-history-text">前进</span>
+            </button>
+            <span id="historyHint" class="history-hint">可后退 0 · 可前进 0</span>
+          </div>
         </div>
-      </div>
-      <div>
-        <label for="userPrompt">用户输入（自然语言）</label>
-        <textarea id="userPrompt" placeholder="例如：订单支付成功后，若金额大于 1000 则通知财务，否则记录日志，最后标记处理完成"></textarea>
-      </div>
-      <div class="toolbar">
-        <button class="btn-primary" id="btnGenerate">调用 DeepSeek 生成 MWGL</button>
-        <label class="chk-inline" title="开启后会携带上一轮需求与当前工作流，按增量修改方式生成">
-          <input type="checkbox" id="chkContextMode" checked />
-          <span>上下文增量模式</span>
-        </label>
-        <div class="optimize-bar" id="optimizeBar">
-          <span class="optimize-bar-label">生成后优化</span>
-          <select id="selectPostOptimize" aria-label="是否进行 Top-4 优化">
-            <option value="none">关闭</option>
-            <option value="top4" selected>开启 Top-4</option>
+        
+        <div class="api-config-row">
+          <label for="apiBase">后端地址</label>
+          <input id="apiBase" value="http://localhost:3001" class="api-base-input" />
+        </div>
+
+        <div class="prompt-container">
+          <textarea id="userPrompt" class="prompt-input" placeholder="用自然语言描述你的工作流需求，例如：订单支付成功后，若金额大于1000则通知财务，否则记录日志，最后标记处理完成"></textarea>
+          <div class="prompt-actions">
+            <button class="btn-primary btn-generate" id="btnGenerate">🚀 执行当前方式</button>
+            <div class="generate-options">
+              <div class="gen-mode-group">
+                <label for="selectGenMode">操作方式</label>
+                <select id="selectGenMode" class="gen-mode-select">
+                  <option value="regen_workflow">重新生成工作流</option>
+                  <option value="regen_pseudo">重新生成伪代码</option>
+                  <option value="regen_code">重新生成代码</option>
+                  <option value="incr_workflow">增量优化工作流</option>
+                  <option value="incr_pseudo">增量优化伪代码</option>
+                  <option value="incr_code">增量优化代码</option>
+                </select>
+                <span id="genModeHint" class="gen-mode-hint"></span>
+              </div>
+              <div class="optimize-group">
+                <select id="selectPostOptimize">
+                  <option value="none">不优化</option>
+                  <option value="top4" selected>Top-2 优化</option>
+                </select>
+                <select id="selectTop4SearchMode">
+                  <option value="beam" selected>束搜索</option>
+                  <option value="mcts">MCTS</option>
+                </select>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="quick-actions">
+          <button id="btnParseMwgl">导入 MWGL</button>
+          <button id="btnExportMwgl">导出 MWGL</button>
+          <button id="btnExportJson">导出 JSON</button>
+          <button id="btnPseudocode">生成伪代码</button>
+          <button id="btnGenCode">生成代码</button>
+          <button id="btnRunCode">运行自检</button>
+          <button id="btnRepairCode" type="button" title="根据运行日志中的报错请 LLM 修复代码">根据报错修复</button>
+          <select id="codeLanguage">
+            <option value="Python">Python</option>
+            <option value="JavaScript">JavaScript</option>
+            <option value="Java">Java</option>
+            <option value="C++">C++</option>
+            <option value="Go">Go</option>
           </select>
-          <span class="optimize-bar-label">搜索</span>
-          <select id="selectTop4SearchMode" aria-label="Top-4 搜索方式">
-            <option value="beam" selected>束搜索（默认）</option>
-            <option value="mcts">MCTS（UCT）</option>
-          </select>
         </div>
-        <button id="btnParseMwgl">从 MWGL 文本导入</button>
-        <button id="btnExportMwgl">导出 MWGL 文本</button>
-        <button id="btnExportJson">导出 JSON</button>
-        <button id="btnPseudocode">生成伪代码</button>
-        <button id="btnGenCode">生成代码</button>
-        <button id="btnRunCode">快速自检运行</button>
-        <select id="codeLanguage" style="width:auto;padding:4px 8px;font-size:13px;">
-          <option value="Python">Python</option>
-          <option value="JavaScript">JavaScript</option>
-          <option value="Java">Java</option>
-          <option value="C++">C++</option>
-          <option value="Go">Go</option>
-        </select>
+
+        <div class="status-bar">
+          <div id="status" class="status-text"></div>
+          <div id="optimizeHint" class="optimize-hint"></div>
+        </div>
+
+        <aside class="error-panel hidden" id="constraintPanel">
+          <div class="error-panel-title">⚠️ 约束错误</div>
+          <ul class="error-list" id="constraintList"></ul>
+        </aside>
       </div>
-      <p class="optimize-hint" id="optimizeHint" aria-live="polite"></p>
-      <div class="status" id="status"></div>
-      <aside class="error-panel hidden" id="constraintPanel" aria-live="polite">
-        <div class="error-panel-title">约束错误</div>
-        <ul class="error-list" id="constraintList"></ul>
+
+      <aside class="human-review-bar hidden" id="humanReviewPanel" aria-live="polite">
+        <div class="human-review-steps" aria-label="首图确认步骤">
+          <span class="hr-step hr-step-active" id="hrStep1Badge">① 初次修改</span>
+          <span class="hr-step-arrow" aria-hidden="true">→</span>
+          <span class="hr-step" id="hrStep2Badge">② 最终确认</span>
+        </div>
+
+        <div id="humanReviewPhase1">
+          <div class="human-review-title">第一步：初次修改（在下方画布改图）</div>
+          <p class="human-review-lead">
+            重新生成工作流且选了 <strong>Top-2</strong> 时必经本步。在画布上调整首图后，点击右侧绿色按钮
+            <strong>「确认初次修改」</strong>（画布工具栏也有同款按钮），才会进入第二步；此时尚未开始 Top-2 搜索。
+          </p>
+          <ul class="human-review-tips">
+            <li>可拖动节点、改边 label、添加 for 循环节点</li>
+            <li>有约束错误时须先修复（顶部红条提示），否则无法确认</li>
+          </ul>
+          <div class="human-review-action-row">
+            <span class="human-review-action-hint" id="humanReviewActionHint">改完画布后点此确认 →</span>
+            <button type="button" class="btn-primary btn-hr-confirm" id="btnFinishInitialEdit">
+              确认初次修改
+            </button>
+          </div>
+        </div>
+
+        <div id="humanReviewPhase2" class="hidden">
+          <div class="human-review-title">第二步：最终确认（补充你的意见）</div>
+          <p class="human-review-lead" id="humanReviewLead">
+            请根据画布上的首图，用文字补充或修正你的需求（例如：分支条件、遗漏步骤、失败路径、节点文案倾向）。
+            确认后将把<strong>原始需求 + 下方补充</strong>一并交给 Top-2 优化。
+          </p>
+          <label for="humanReviewFinalInput" class="human-review-input-label">你的补充意见</label>
+          <textarea
+            id="humanReviewFinalInput"
+            class="human-review-final-input"
+            rows="3"
+            placeholder="例如：金额大于 1000 走财务审批分支；支付失败要有明确 failure 终态…（若无补充可留空）"
+          ></textarea>
+          <details class="human-review-ref-details">
+            <summary>查看系统参考（校验 / 评测提示，可选）</summary>
+            <ul class="human-review-list" id="humanReviewList"></ul>
+          </details>
+          <div class="human-review-action-row">
+            <span class="human-review-action-hint">补充意见后点此开始搜索 →</span>
+            <button type="button" class="btn-primary btn-hr-confirm btn-continue-optimize" id="btnContinueOptimize">
+              确认意见并开始 Top-2
+            </button>
+          </div>
+        </div>
       </aside>
-    </div>
 
-    <div class="workbench">
-      <div class="panel">
-        <div class="toolbar toolbar-nodes">
+      <!-- 画布工作区 -->
+      <div class="canvas-section">
+        <div class="canvas-toolbar">
           <button id="addEvent">start</button>
           <button id="addStep">step</button>
           <button id="addForLoop">for 循环</button>
           <button id="addBranch">branch</button>
           <button id="addEndSuccess">end ✓</button>
           <button id="addEndFailure">end ✗</button>
-          <button id="btnLayoutLr" type="button">从左到右排列</button>
+          <div class="spacer"></div>
+          <div class="human-review-toolbar hidden" id="humanReviewToolbar" aria-label="Top-2 首图确认">
+            <span class="human-review-toolbar-label" id="humanReviewToolbarLabel">Top-2 · ① 初次修改</span>
+            <button type="button" class="btn-primary btn-hr-confirm-sm" id="btnFinishInitialEditToolbar">
+              确认初次修改
+            </button>
+            <button type="button" class="btn-primary btn-hr-confirm-sm hidden" id="btnContinueOptimizeToolbar">
+              开始 Top-2
+            </button>
+          </div>
+          <button id="btnLayoutLr">自动排列</button>
         </div>
-        <div class="canvas" id="canvas" tabindex="0">
-          <div class="canvas-viewport" id="canvasViewport">
-            <div class="canvas-world" id="canvasWorld"></div>
+        
+        <div class="canvas-container">
+          <div class="canvas" id="canvas" tabindex="0">
+            <div class="canvas-viewport" id="canvasViewport">
+              <div class="canvas-world" id="canvasWorld"></div>
+            </div>
           </div>
         </div>
-                <div class="hint">工作流默认居中在画布内；空白处拖拽平移；Ctrl+滚轮缩放；节点可拖动；Shift+拖节点可连线；带 <strong>for</strong> 的节点点击可编辑循环体。</div>
+        
+        <div class="canvas-hint">
+          空白处拖拽平移 | Ctrl+滚轮缩放 | 节点可拖动 | Shift+拖节点连线 | 循环节点内嵌子步骤预览，点击可编辑循环体
+        </div>
+      </div>
+    </main>
+
+    <!-- 右侧：标签面板 -->
+    <aside class="sidebar-right">
+      <div class="tab-header">
+        <button class="tab-btn active" data-tab="node-editor">节点编辑</button>
+        <button class="tab-btn" data-tab="mwgl">MWGL</button>
+        <button class="tab-btn" data-tab="json">JSON</button>
+        <button class="tab-btn" data-tab="pseudo">伪代码</button>
+        <button class="tab-btn" data-tab="code">代码</button>
+        <button class="tab-btn" data-tab="log">运行日志</button>
       </div>
 
-      <aside id="loopPanel" class="loop-panel hidden" aria-label="循环体编辑">
-        <div class="loop-panel-header">
-          <h2 id="loopPanelTitle">循环体</h2>
-          <button type="button" id="loopPanelClose" class="loop-panel-close" title="关闭">×</button>
-        </div>
-        <p id="loopPanelBreadcrumb" class="loop-breadcrumb"></p>
-        <div class="loop-field">
-          <label for="loopKind">循环类型</label>
-          <select id="loopKind"><option value="for">for</option><option value="while">while</option></select>
-        </div>
-        <div class="loop-field">
-          <label for="loopCondition">条件 / 迭代</label>
-          <input id="loopCondition" placeholder="重试次数 &lt; 3" />
-        </div>
-        <button type="button" id="loopSaveMeta" class="btn-primary loop-save-meta">保存循环条件</button>
-        <div id="loopLoopStepList" class="loop-step-list"></div>
-        <div class="toolbar loop-toolbar">
-          <button type="button" id="loopAddStep">+ 步骤</button>
-          <button type="button" id="loopAddFor">+ 嵌套 for</button>
-          <button type="button" id="loopAddSubflow">+ 子工作流</button>
-        </div>
-      </aside>
-
-
-            <div class="panel">
-        <label for="nodeType">节点类型</label>
-        <select id="nodeType">
-          <option value="start">start</option>
-          <option value="step">step</option>
-          <option value="branch">branch</option>
-          <option value="end">end</option>
-        </select>
-        <div id="endOutcomeRow" class="hidden">
-          <label for="nodeOutcome">终态 outcome</label>
-          <select id="nodeOutcome">
-            <option value="success">success</option>
-            <option value="failure">failure</option>
+      <div class="tab-content active" id="tab-node-editor">
+        <div class="panel-content">
+          <label for="nodeType">节点类型</label>
+          <select id="nodeType">
+            <option value="start">start</option>
+            <option value="step">step</option>
+            <option value="branch">branch</option>
+            <option value="end">end</option>
           </select>
-        </div>
-        <label for="nodeText">节点文本</label>
-        <textarea id="nodeText" placeholder="step：动词+对象；branch：条件说明；end failure：具体失败语义"></textarea>
-        <div class="grid-2">
-          <div>
-            <label for="nodeX">X（画布中心为 0，右为正）</label>
-            <input id="nodeX" type="number" />
+          
+          <div id="endOutcomeRow" class="hidden">
+            <label for="nodeOutcome">终态</label>
+            <select id="nodeOutcome">
+              <option value="success">success</option>
+              <option value="failure">failure</option>
+            </select>
           </div>
-          <div>
-            <label for="nodeY">Y（画布中心为 0，下为正）</label>
-            <input id="nodeY" type="number" />
+          
+          <label for="nodeText">节点文本</label>
+          <textarea id="nodeText" placeholder="step：动词+对象；branch：条件说明；end failure：具体失败语义"></textarea>
+          
+          <div class="grid-2">
+            <div>
+              <label for="nodeX">X 坐标</label>
+              <input id="nodeX" type="number" />
+            </div>
+            <div>
+              <label for="nodeY">Y 坐标</label>
+              <input id="nodeY" type="number" />
+            </div>
+          </div>
+          
+          <div class="btn-group">
+            <button id="saveNode" class="btn-primary">保存修改</button>
+            <button id="deleteNode" class="btn-danger">删除节点</button>
+          </div>
+          
+          <hr class="section-line" />
+          
+          <label for="edgeFrom">连线起点</label>
+          <select id="edgeFrom"></select>
+          <label for="edgeTo">连线终点</label>
+          <select id="edgeTo"></select>
+          <label for="edgeLabel">分支标签</label>
+          <input id="edgeLabel" placeholder="例如：已认证、金额>1000" />
+          <label for="edgeSelect">已有连线</label>
+          <select id="edgeSelect"></select>
+          
+          <div class="btn-group">
+            <button id="saveEdge" class="btn-primary">保存连线</button>
+            <button id="deleteEdge" class="btn-danger">删除连线</button>
           </div>
         </div>
-        <div class="toolbar" style="margin-top:8px;">
-          <button id="saveNode" class="btn-primary">保存节点修改</button>
-          <button id="deleteNode" class="btn-danger">删除节点</button>
-        </div>
-        <div class="hint">没有选中节点时，将自动选择第一个节点。</div>
-        <hr class="section-line" />
-        <label for="edgeFrom">连线起点</label>
-        <select id="edgeFrom"></select>
-        <label for="edgeTo">连线终点</label>
-        <select id="edgeTo"></select>
-        <label for="edgeLabel">分支标签（从 branch 出发必填）</label>
-        <input id="edgeLabel" placeholder="例如：已认证、金额>1000" />
-        <label for="edgeSelect">已有连线</label>
-        <select id="edgeSelect"></select>
-        <div class="toolbar" style="margin-top:8px;">
-          <button id="saveEdge" class="btn-primary">新增/更新连线</button>
-          <button id="deleteEdge" class="btn-danger">删除连线</button>
+      </div>
+
+      <div class="tab-content" id="tab-mwgl">
+        <div class="panel-content">
+          <textarea id="mwglText" class="code-textarea" placeholder="MWGL 文本将在这里显示"></textarea>
         </div>
       </div>
-    </div>
 
-    <div class="split">
-      <div class="panel">
-        <label for="mwglText">MWGL 文本（MODE graph）</label>
-        <textarea id="mwglText" placeholder="RULE R_xxx &quot;规则名&quot;&#10;VERSION 2&#10;MODE graph&#10;NODE n_start start &quot;开始&quot;&#10;EDGE n_start -> n_next &quot;&quot;"></textarea>
+      <div class="tab-content" id="tab-json">
+        <div class="panel-content">
+          <pre id="jsonView" class="code-pre"></pre>
+        </div>
       </div>
-      <div class="panel">
-        <label>JSON（工作流结构）</label>
-        <pre id="jsonView"></pre>
-      </div>
-    </div>
 
-    <div class="split" style="margin-top:2px;">
-      <div class="panel" style="grid-column: 1 / -1;">
-        <label for="pseudocodeText">伪代码（DAG → 结构化伪代码，可手动编辑）</label>
-        <textarea id="pseudocodeText" placeholder="点击「生成伪代码」，将当前 DAG 工作流转换为结构化伪代码。"></textarea>
+      <div class="tab-content" id="tab-pseudo">
+        <div class="panel-content code-panel-stack">
+          <div id="pseudoLegend" class="highlight-legend"></div>
+          <div class="code-highlight-wrap">
+            <pre id="pseudocodeHighlight" class="code-highlight-layer" aria-hidden="true"></pre>
+            <textarea id="pseudocodeText" class="code-textarea code-textarea-mirror" placeholder="点击「生成伪代码」生成结构化伪代码"></textarea>
+          </div>
+        </div>
       </div>
-    </div>
 
-    <div class="split" style="margin-top:2px;">
-      <div class="panel" style="grid-column: 1 / -1;">
-        <label for="codeText">真实代码（伪代码 → 可执行代码，可手动编辑）</label>
-        <textarea id="codeText" placeholder="先生成伪代码，再点击「生成代码」，将伪代码转换为指定语言的真实代码。"></textarea>
+      <div class="tab-content" id="tab-code">
+        <div class="panel-content code-panel-stack">
+          <div id="codeLegend" class="highlight-legend"></div>
+          <div id="codeCheckBadge" class="code-check-badge hidden"></div>
+          <div class="code-highlight-wrap">
+            <pre id="codeHighlight" class="code-highlight-layer" aria-hidden="true"></pre>
+            <textarea id="codeText" class="code-textarea code-textarea-mirror" placeholder="先生成伪代码，再点击「生成代码」"></textarea>
+          </div>
+        </div>
       </div>
-    </div>
-    <div class="split" style="margin-top:2px;">
-      <div class="panel" style="grid-column: 1 / -1;">
-        <label for="runResultText">运行结果（快速自检）</label>
-        <textarea id="runResultText" placeholder="点击「快速自检运行」后显示 stdout/stderr/退出码。" readonly></textarea>
+
+      <div class="tab-content" id="tab-log">
+        <div class="panel-content code-panel-stack">
+          <div id="runCheckSummary" class="run-check-summary hidden"></div>
+          <textarea id="runResultText" class="code-textarea" readonly placeholder="生成代码后将自动运行检测；也可点击「运行自检」"></textarea>
+        </div>
       </div>
-    </div>
+    </aside>
   </div>
+
+  <!-- 循环体编辑面板（保持原有功能） -->
+  <aside id="loopPanel" class="loop-panel hidden" aria-label="循环体编辑">
+    <div class="loop-panel-header">
+      <h2 id="loopPanelTitle">循环体编辑</h2>
+      <button type="button" id="loopPanelClose" class="loop-panel-close" title="关闭">×</button>
+    </div>
+    <p id="loopPanelBreadcrumb" class="loop-breadcrumb"></p>
+    <div class="loop-field">
+      <label for="loopKind">循环类型</label>
+      <select id="loopKind"><option value="for">for</option><option value="while">while</option></select>
+    </div>
+    <div class="loop-field">
+      <label for="loopCondition">条件 / 迭代</label>
+      <input id="loopCondition" placeholder="重试次数 < 3" />
+    </div>
+    <button type="button" id="loopSaveMeta" class="btn-primary loop-save-meta">保存循环条件</button>
+    <div id="loopLoopStepList" class="loop-step-list"></div>
+    <div class="toolbar loop-toolbar">
+      <button type="button" id="loopAddStep">+ 步骤</button>
+      <button type="button" id="loopAddFor">+ 嵌套 for</button>
+      <button type="button" id="loopAddSubflow">+ 子工作流</button>
+    </div>
+  </aside>
 
   <script type="module" src="./js/main.js"></script>
 </body>

@@ -83,11 +83,11 @@ async function main() {
       algorithm: "top4",
       mutation_mode: "llm_generate",
       top4_search_mode: "beam",
-      top4_keep: 4,
+      top4_keep: 2,
       top4_rounds: Math.floor(args.top4Rounds || 2),
       top4_mcts_extra_rounds: 1,
       top4_mcts_exploration: 1.2,
-      top4_initial_pool: 8,
+      top4_initial_pool: 4,
       top4_children_per_parent: 2,
       retrieval_mode: "faiss",
       eval_topk: 24
