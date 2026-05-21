@@ -125,6 +125,10 @@ MWGL 用**有向图**表示业务流程：
 │   ├── mwgl-top4-search.mjs        # 束搜索 / MCTS（API 字段名仍为 top4_*）
 │   ├── mwgl-generate-validate.mjs
 │   ├── mwgl-graph-utils.mjs
+│   ├── mwgl-pseudo-assembler.mjs   # 伪代码确定性拼装
+│   ├── mwgl-pseudo-parse.mjs       # 伪代码 → 逐节点 map
+│   ├── mwgl-code-lang.mjs          # 多语言代码模板
+│   ├── mwgl-code-assembler.mjs     # main + 逐节点函数拼装
 │   ├── mwgl-loop-summary.mjs
 │   ├── run-check-runner.mjs
 │   └── mwgl-graph-edit-*.mjs       # 可选图编辑距离

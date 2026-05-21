@@ -855,19 +855,10 @@ export function bindInteractions(elements, renderer) {
           x: x + 560,
           y
         };
-        const endNode = {
-          id: uid(),
-          type: "end",
-          outcome: "success",
-          text: "完成",
-          x: x + 840,
-          y
-        };
-        nodesToAdd.push(join, endNode);
+        nodesToAdd.push(join);
         edgesToAdd.push(
           { id: uid("e"), from: s1.id, to: join.id, label: "" },
-          { id: uid("e"), from: s2.id, to: join.id, label: "" },
-          { id: uid("e"), from: join.id, to: endNode.id, label: "" }
+          { id: uid("e"), from: s2.id, to: join.id, label: "" }
         );
       }
       state.workflow.nodes.push(...nodesToAdd);

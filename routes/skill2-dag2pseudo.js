@@ -1,15 +1,11 @@
 import { Router } from "express";
 import { hasKey, callDeepSeek } from "./deepseek.js";
-import {
-  buildGraph,
-  topoSort,
-  reachableFromStart,
-  findConvergence,
-  parseJsonResponse,
-  prepareNodeList
-} from "../lib/mwgl-graph-utils.mjs";
-import { appendLoopPseudoForNode } from "../js/mwgl-loop.js";
+import { parseJsonResponse, prepareNodeList } from "../lib/mwgl-graph-utils.mjs";
 import { summarizeNodeLoop } from "../lib/mwgl-loop-summary.mjs";
+import {
+  formatPseudocodeOutput,
+  mergeEnhancedTexts
+} from "../lib/mwgl-pseudo-assembler.mjs";
 import {
   PSEUDO_INCR_SYSTEM,
   buildIncrementalPseudoUserMessage
@@ -39,97 +35,6 @@ const SYSTEM_PROMPT = `你是 MWGL v3 伪代码文字润色器。
 - 不要改写或省略 condition 的语义；kind=for 侧重迭代范围，kind=while 侧重持续条件
 
 只输出 JSON 对象本身，不要 markdown、不要代码块标记、不要解释。`;
-
-function assemblePseudocode(workflow, texts) {
-  const { nodes, nodeMap, outEdges } = buildGraph(workflow);
-  const subworkflows = workflow?.subworkflows || {};
-  const topoOrder = topoSort(nodes, workflow?.edges || []);
-  const topoIndex = new Map(topoOrder.map((id, i) => [id, i]));
-  const reachable = reachableFromStart(nodes, outEdges);
-  const start = nodes.find((n) => n.type === "start");
-
-  const visited = new Set();
-  const lines = [];
-  const emit = (indent, text) => lines.push("  ".repeat(indent) + text);
-  const getText = (id) => texts[id] || nodeMap.get(id)?.text || "未知";
-
-  function traverse(nodeId, indent, stopBefore) {
-    if (stopBefore && nodeId === stopBefore) return;
-    if (visited.has(nodeId)) return;
-    if (!nodeMap.has(nodeId) || !reachable.has(nodeId)) return;
-    visited.add(nodeId);
-
-    const node = nodeMap.get(nodeId);
-    const outs = (outEdges.get(nodeId) || []).filter(
-      (e) => nodeMap.has(e.to) && reachable.has(e.to)
-    );
-    const desc = getText(nodeId);
-
-    switch (node.type) {
-      case "start":
-        emit(indent, `BEGIN WORKFLOW ${workflow.rule_name || "未命名"}  # [${node.id}] ${desc}`);
-        for (const e of outs) traverse(e.to, indent + 1, null);
-        emit(indent, "END WORKFLOW");
-        break;
-
-      case "step":
-        emit(indent, `STEP  # [${node.id}] ${desc}`);
-        if (node.loop) appendLoopPseudoForNode(node, subworkflows, lines, indent + 1);
-        for (const e of outs) traverse(e.to, indent, stopBefore);
-        break;
-
-      case "branch": {
-        const targets = outs.map((e) => e.to);
-        const conv = findConvergence(targets, outEdges, nodeMap, topoIndex);
-        emit(indent, `IF  # [${node.id}] ${desc}`);
-        outs.forEach((e, i) => {
-          const kw = i === 0 ? "IF" : "ELSE IF";
-          emit(indent + 1, `${kw}  # [${e.id}] ${e.label || "条件"}`);
-          traverse(e.to, indent + 2, conv);
-        });
-        emit(indent, "END IF");
-        if (conv) traverse(conv, indent, stopBefore);
-        break;
-      }
-
-      case "parallel": {
-        const targets = outs.map((e) => e.to);
-        const conv = findConvergence(targets, outEdges, nodeMap, topoIndex);
-        emit(indent, `PARALLEL  # [${node.id}] ${desc}`);
-        outs.forEach((e) => {
-          emit(indent + 1, `ARM ${e.label || "臂"}  # [${e.id}]`);
-          traverse(e.to, indent + 2, conv);
-        });
-        emit(indent, "END PARALLEL");
-        if (conv) traverse(conv, indent, stopBefore);
-        break;
-      }
-
-      case "end": {
-        const kw = node.outcome === "failure" ? "FAILURE" : "SUCCESS";
-        emit(indent, `${kw}  # [${node.id}] ${desc}`);
-        break;
-      }
-
-      default:
-        emit(indent, `STEP  # [${node.id}] ${desc}`);
-        for (const e of outs) traverse(e.to, indent, stopBefore);
-    }
-  }
-
-  if (start) traverse(start.id, 0, null);
-
-  const unreachable = nodes.filter((n) => !reachable.has(n.id));
-  if (unreachable.length) {
-    lines.push("");
-    lines.push("# 不可达节点（草稿，不参与执行）");
-    for (const n of unreachable) {
-      lines.push(`# [${n.id}] ${n.type}: ${getText(n.id)}`);
-    }
-  }
-
-  return lines.join("\n");
-}
 
 function buildNodeListUserMessage(workflow, nodeList) {
   const nodeMap = new Map((workflow?.nodes || []).map((n) => [n.id, n]));
@@ -195,10 +100,10 @@ router.post("/api/mwgl/pseudocode", async (req, res) => {
       enhancedTexts = parseJsonResponse(raw);
     } catch {
       enhancedTexts = {};
-      for (const n of workflow.nodes) enhancedTexts[n.id] = n.text;
     }
 
-    const content = assemblePseudocode(workflow, enhancedTexts);
+    const texts = mergeEnhancedTexts(workflow, enhancedTexts);
+    const content = formatPseudocodeOutput(workflow, texts);
     res.json({ content });
   } catch (error) {
     if (error.status) return res.status(error.status).json({ error: error.message });
