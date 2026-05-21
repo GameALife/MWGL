@@ -61,39 +61,171 @@ export function buildNodeMetaMap(workflow) {
   return map;
 }
 
-/** 伪代码：按行标注所属节点/边 */
+/**
+ * 伪代码按行标注所属节点/边。
+ * v3：main.flow 段用 CALL/IF id；逐节点 .pseudo 段整文件归属该节点。
+ */
 export function buildPseudoLineNodes(text, workflow) {
   const edgeFrom = new Map((workflow?.edges || []).map((e) => [e.id, e.from]));
+  const nodeIds = new Set((workflow?.nodes || []).map((n) => n.id));
   const lines = String(text || "").split("\n");
   const result = [];
+
+  /** @type {"main"|"nodes"|"legacy"} */
+  let section = "legacy";
   let currentNodeId = null;
 
+  const pushStructural = () => result.push({ nodeId: null, edgeId: null, structural: true });
+  const pushNode = (nodeId, structural = false, edgeId = null) =>
+    result.push({ nodeId, edgeId, structural });
+
   for (const line of lines) {
+    const trimmed = line.trim();
+
+    if (/^#\s*main\.flow\s*$/i.test(trimmed)) {
+      section = "main";
+      currentNodeId = null;
+      pushStructural();
+      continue;
+    }
+    if (/^#\s*=+.*逐节点/i.test(trimmed) || /^#\s*=+/.test(trimmed)) {
+      section = "nodes";
+      currentNodeId = null;
+      pushStructural();
+      continue;
+    }
+    if (/^#/.test(trimmed)) {
+      pushStructural();
+      continue;
+    }
+
+    const pseudoFileM = line.match(/^---\s+(\S+)\.pseudo\s*---/);
+    if (pseudoFileM) {
+      section = "nodes";
+      currentNodeId = pseudoFileM[1];
+      pushNode(currentNodeId, false);
+      continue;
+    }
+
+    if (section === "nodes" && currentNodeId) {
+      const loopKw = /^\s*(?:FOR|WHILE|END\s+(?:FOR|WHILE))\b/i.test(line);
+      pushNode(currentNodeId, loopKw);
+      continue;
+    }
+
+    if (section === "main" || (section === "legacy" && /^\s*CALL\s+\S+/.test(line))) {
+      if (section === "legacy" && /^\s*CALL\s+/.test(line)) section = "main";
+
+      if (/^\s*BEGIN\s+WORKFLOW/i.test(line)) {
+        section = "main";
+        pushStructural();
+        continue;
+      }
+      if (/^\s*END\s+WORKFLOW/i.test(line)) {
+        pushStructural();
+        continue;
+      }
+
+      const callM = line.match(/^\s*CALL\s+(\S+)/);
+      if (callM?.[1] && nodeIds.has(callM[1])) {
+        currentNodeId = callM[1];
+        pushNode(callM[1], false);
+        continue;
+      }
+
+      const termM = line.match(/^\s*(SUCCESS|FAILURE)\s+(\S+)/);
+      if (termM?.[2] && nodeIds.has(termM[2])) {
+        currentNodeId = termM[2];
+        pushNode(termM[2], false);
+        continue;
+      }
+
+      const ifM = line.match(/^\s*IF\s+(\S+)/);
+      if (ifM?.[1] && nodeIds.has(ifM[1])) {
+        currentNodeId = ifM[1];
+        pushNode(ifM[1], false);
+        continue;
+      }
+
+      const parM = line.match(/^\s*PARALLEL\s+(\S+)/);
+      if (parM?.[1] && nodeIds.has(parM[1])) {
+        currentNodeId = parM[1];
+        pushNode(parM[1], false);
+        continue;
+      }
+
+      if (/^\s*END\s+(?:IF|PARALLEL)\b/i.test(line)) {
+        pushStructural();
+        continue;
+      }
+
+      const edgeM = line.match(/#\s*\[([^\]]+)\]/);
+      if (/^\s*(?:BRANCH|ELSE)\b/i.test(line)) {
+        if (edgeM?.[1] && edgeFrom.has(edgeM[1])) {
+          pushNode(edgeFrom.get(edgeM[1]), true, edgeM[1]);
+        } else {
+          pushNode(currentNodeId, true);
+        }
+        continue;
+      }
+      if (/^\s*ARM\b/i.test(line)) {
+        if (edgeM?.[1] && edgeFrom.has(edgeM[1])) {
+          pushNode(edgeFrom.get(edgeM[1]), true, edgeM[1]);
+        } else {
+          pushNode(currentNodeId, true);
+        }
+        continue;
+      }
+
+      if (!trimmed) {
+        pushStructural();
+        continue;
+      }
+      pushNode(currentNodeId, !currentNodeId);
+      continue;
+    }
+
     const nodeM = line.match(/#\s*\[([^\]]+)\]/);
     if (nodeM) {
       const id = nodeM[1];
       if (edgeFrom.has(id)) {
         currentNodeId = edgeFrom.get(id) || id;
-        result.push({ nodeId: currentNodeId, edgeId: id, structural: false });
-      } else {
+        pushNode(currentNodeId, false, id);
+      } else if (nodeIds.has(id)) {
         currentNodeId = id;
-        result.push({ nodeId: id, edgeId: null, structural: false });
+        pushNode(id, false);
+      } else {
+        pushNode(currentNodeId, true);
       }
       continue;
     }
-    if (/^\s*(BEGIN|END)\s+WORKFLOW/i.test(line)) {
-      result.push({ nodeId: null, edgeId: null, structural: true });
+
+    if (/^\s*BEGIN\s+WORKFLOW/i.test(line)) {
+      section = "main";
+      pushStructural();
+      continue;
+    }
+    if (/^\s*END\s+WORKFLOW/i.test(line)) {
+      pushStructural();
       continue;
     }
     if (
-      /^\s*(IF|ELSE IF|ELSE|END IF|PARALLEL|ARM|END PARALLEL|FOR|WHILE|END FOR|END WHILE)\b/i.test(
-        line
-      )
+      section === "legacy" &&
+      /^\s*(IF|ELSE IF|ELSE|END IF|PARALLEL|ARM|END PARALLEL)\b/i.test(line)
     ) {
-      result.push({ nodeId: currentNodeId, edgeId: null, structural: true });
+      pushNode(currentNodeId, true);
       continue;
     }
-    result.push({ nodeId: currentNodeId, edgeId: null, structural: false });
+    if (section === "legacy" && /^\s*(FOR|WHILE|END FOR|END WHILE)\b/i.test(line)) {
+      pushNode(currentNodeId, true);
+      continue;
+    }
+
+    if (!trimmed) {
+      pushStructural();
+      continue;
+    }
+    pushNode(currentNodeId, !currentNodeId);
   }
   return result;
 }
@@ -162,19 +294,20 @@ export function renderHighlightedHtml(text, lineMeta, metaMap) {
     const meta = lineMeta[i] || {};
     let colors = TYPE_COLORS.structural;
     let title = "结构/框架";
-    if (meta.nodeId && metaMap.has(meta.nodeId)) {
+    if (meta.edgeId && metaMap.has(meta.edgeId)) {
+      const m = metaMap.get(meta.edgeId);
+      colors = m.colors;
+      title = `${m.shortLabel} · ${meta.edgeId}`;
+      if (m.text) title += ` — ${m.text}`;
+    } else if (meta.nodeId && metaMap.has(meta.nodeId)) {
       const m = metaMap.get(meta.nodeId);
       colors = m.colors;
       title = `${m.shortLabel} · ${meta.nodeId}`;
       if (m.text) title += ` — ${m.text.slice(0, 40)}`;
-    } else if (meta.edgeId && metaMap.has(meta.edgeId)) {
-      const m = metaMap.get(meta.edgeId);
-      colors = m.colors;
-      title = `${m.shortLabel} · ${meta.edgeId}`;
     }
-    const bg = meta.structural && !meta.nodeId ? TYPE_COLORS.structural.bg : colors.bg;
+    const bg = meta.structural && !meta.nodeId && !meta.edgeId ? TYPE_COLORS.structural.bg : colors.bg;
     const border = colors.border;
-    const opacity = meta.structural && meta.nodeId ? "0.55" : "1";
+    const opacity = meta.structural && meta.nodeId && !meta.edgeId ? "0.72" : "1";
     const content = line.length ? escapeHtml(line) : "&nbsp;";
     return (
       `<div class="hl-line" style="background:${bg};border-left:3px solid ${border};opacity:${opacity}" ` +

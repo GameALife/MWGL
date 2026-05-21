@@ -217,7 +217,9 @@ MWGL 用**有向图**表示业务流程：
 { "workflow": { "mwgl_version": 3, "nodes": [], "edges": [] } }
 ```
 
-返回 `{ "content": "BEGIN WORKFLOW\n..." }`。拓扑排序 → LLM 润色各节点单行描述（JSON）→ 程序拼装控制流（含循环 `FOR/WHILE`）。
+返回 `{ "content": "...", "mainFlow": "...", "nodeFiles": { "节点id": "..." } }`。
+
+v3：**main.flow** 由程序按图边关系确定性生成（`CALL` / `IF` / `PARALLEL`，只描述怎么串）；每个节点单独一次 LLM 调用生成 `--- id.pseudo ---` 正文（做什么，循环体 `FOR/WHILE` 由程序展开）。`content` 为二者序列化，供编辑器展示。
 
 ### `POST /api/mwgl/code`
 
@@ -229,7 +231,7 @@ MWGL 用**有向图**表示业务流程：
 }
 ```
 
-支持 `Python`、`JavaScript`、`Java`、`Go`、`C++`（**运行检测**五种语言均支持，需本机安装对应编译器/解释器）。逐节点生成 `node_*` 函数后拼装 `main`。
+支持 `Python`、`JavaScript`、`Java`、`Go`、`C++`（**运行检测**五种语言均支持，需本机安装对应编译器/解释器）。从 `nodeFiles` / `--- id.pseudo ---` 解析描述后**逐节点** LLM 生成 `node_*` 函数；`main` 由程序按工作流图确定性拼装（与 `main.flow` 结构一一对应）。可选请求体字段：`mainFlow`、`nodeFiles`。
 
 ### `POST /api/mwgl/run-check`
 

@@ -51,7 +51,11 @@ export async function dagToPseudocode({
   }
 
   const data = await res.json();
-  return data?.content || "";
+  return {
+    content: data?.content || "",
+    mainFlow: data?.mainFlow || "",
+    nodeFiles: data?.nodeFiles || {}
+  };
 }
 
 /** 首图人工修订阶段的结构化建议。 */
@@ -163,25 +167,31 @@ export async function optimizeWorkflowMcts(params) {
 export async function pseudoToCode({
   base,
   pseudocode,
+  mainFlow = "",
+  nodeFiles = null,
   language,
   workflow,
   mode = "regen",
   existingCode = "",
   revisionNotes = ""
 }) {
+  const body = {
+    pseudocode,
+    language,
+    workflow,
+    mode: mode === "incremental" ? "incremental" : "regen",
+    existingCode,
+    revisionNotes
+  };
+  if (mainFlow) body.mainFlow = mainFlow;
+  if (nodeFiles && typeof nodeFiles === "object") body.nodeFiles = nodeFiles;
+
   const res = await fetch(`${base}/api/mwgl/code`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json"
     },
-    body: JSON.stringify({
-      pseudocode,
-      language,
-      workflow,
-      mode: mode === "incremental" ? "incremental" : "regen",
-      existingCode,
-      revisionNotes
-    })
+    body: JSON.stringify(body)
   });
 
   if (!res.ok) {

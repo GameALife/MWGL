@@ -7,8 +7,9 @@
 export const NODE_LAYOUT_WIDTH = 200;
 export const NODE_LAYOUT_HEIGHT = 56;
 
-export const WORLD_WIDTH = 7000;
-export const WORLD_HEIGHT = 5000;
+/** 可平移/摆放节点的世界画布像素尺寸（越大空白拖拽范围越大） */
+export const WORLD_WIDTH = 14000;
+export const WORLD_HEIGHT = 10000;
 
 export function workflowBBox(nodes, nodeW = NODE_LAYOUT_WIDTH, nodeH = NODE_LAYOUT_HEIGHT) {
   if (!nodes?.length) return null;

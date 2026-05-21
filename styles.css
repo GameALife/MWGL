@@ -190,7 +190,7 @@ body {
 }
 .input-section {
   flex: 0 1 auto;
-  max-height: min(48vh, 480px);
+  max-height: min(38vh, 400px);
   padding: 16px 24px;
   border-bottom: 1px solid var(--line);
   background: var(--panel);
@@ -589,7 +589,7 @@ body {
 /* 画布区域 */
 .canvas-section {
   flex: 1 1 0;
-  min-height: 240px;
+  min-height: 420px;
   display: flex;
   flex-direction: column;
   padding: 16px 24px;
@@ -632,8 +632,7 @@ body {
   position: absolute;
   left: 0;
   top: 0;
-  width: 7000px;
-  height: 5000px;
+  /* 宽高由 renderer 按 viewport.js 的 WORLD_* 写入 */
   transform-origin: 0 0;
   will-change: transform;
   background:
@@ -1347,6 +1346,116 @@ button:hover {
 .loop-badge-branch { background: #dcfce7; color: #15803d; }
 .loop-toolbar { flex-wrap: wrap; gap: 6px; }
 .loop-hint { font-size: 12px; color: #64748b; }
+
+/* 顶栏设置弹窗 */
+.mwgl-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.mwgl-modal.hidden {
+  display: none;
+}
+.mwgl-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+}
+.mwgl-modal-panel {
+  position: relative;
+  width: min(440px, calc(100vw - 32px));
+  background: var(--panel);
+  border-radius: 12px;
+  box-shadow: var(--shadow-lg);
+  border: 1px solid var(--line);
+  overflow: hidden;
+}
+.mwgl-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--line);
+}
+.mwgl-modal-header h2 {
+  margin: 0;
+  font-size: 17px;
+}
+.mwgl-modal-close {
+  border: none;
+  background: transparent;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  color: var(--muted);
+  padding: 4px 8px;
+  border-radius: 6px;
+}
+.mwgl-modal-close:hover {
+  background: var(--sidebar-bg);
+  color: var(--text);
+}
+.mwgl-modal-body {
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.mwgl-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.mwgl-field input,
+.mwgl-field select {
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 14px;
+  color: var(--text);
+}
+.mwgl-modal-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+.mwgl-modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 20px 16px;
+  border-top: 1px solid var(--line);
+}
+.btn-secondary {
+  padding: 8px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  cursor: pointer;
+  font-size: 14px;
+}
+.btn-secondary:hover {
+  background: var(--sidebar-bg);
+}
+.btn-danger-outline {
+  padding: 8px 12px;
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+  background: #fff;
+  color: var(--danger);
+  cursor: pointer;
+  font-size: 13px;
+  align-self: flex-start;
+}
+.btn-danger-outline:hover {
+  background: #fef2f2;
+}
 
 /* 响应式 */
 @media (max-width: 1400px) {

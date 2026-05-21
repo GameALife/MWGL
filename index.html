@@ -356,6 +356,37 @@
     </div>
   </aside>
 
+  <input type="file" id="importSessionsFile" accept="application/json,.json" hidden />
+
+  <div id="settingsModal" class="mwgl-modal hidden" role="dialog" aria-labelledby="settingsModalTitle" aria-modal="true">
+    <div class="mwgl-modal-backdrop" data-close-settings></div>
+    <div class="mwgl-modal-panel">
+      <header class="mwgl-modal-header">
+        <h2 id="settingsModalTitle">设置</h2>
+        <button type="button" class="mwgl-modal-close" data-close-settings aria-label="关闭">×</button>
+      </header>
+      <div class="mwgl-modal-body">
+        <label class="mwgl-field">
+          <span>后端地址</span>
+          <input id="settingsApiBase" type="text" placeholder="http://localhost:3001" />
+        </label>
+        <label class="mwgl-field">
+          <span>生成后优化</span>
+          <select id="settingsPostOptimize">
+            <option value="none">不优化</option>
+            <option value="top4">Top-2（需 Qwen）</option>
+          </select>
+        </label>
+        <p class="mwgl-modal-hint">Top-2 需服务端配置 QWEN_API_KEY 与 QWEN_BASE_URL；未配置时将自动跳过优化。</p>
+        <button type="button" id="btnClearAllSessions" class="btn-danger-outline">清空全部窗口数据</button>
+      </div>
+      <footer class="mwgl-modal-footer">
+        <button type="button" class="btn-secondary" data-close-settings>取消</button>
+        <button type="button" id="btnSaveSettings" class="btn-primary">保存</button>
+      </footer>
+    </div>
+  </div>
+
   <script type="module" src="./js/main.js"></script>
 </body>
 </html>

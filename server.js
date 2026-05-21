@@ -21,8 +21,20 @@ app.use(cors({ origin: corsOrigin === "*" ? true : corsOrigin.split(",").map((s)
 app.use(express.json({ limit: "1mb" }));
 app.use(express.static("."));
 
+function hasQwenConfigured() {
+  return Boolean(
+    String(process.env.QWEN_API_KEY || "").trim() &&
+    String(process.env.QWEN_BASE_URL || "").trim()
+  );
+}
+
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, hasKey: hasKey(), deepseekBase: getBase() });
+  res.json({
+    ok: true,
+    hasKey: hasKey(),
+    hasQwen: hasQwenConfigured(),
+    deepseekBase: getBase()
+  });
 });
 
 app.use(skill1);
@@ -36,6 +48,19 @@ app.use(codeRepair);
 app.use(graphEditEval);
 app.use(workflowSuggestions);
 
-app.listen(port, () => {
-  console.log(`MWGL v2 server listening on http://localhost:${port}`);
+const server = app.listen(port, () => {
+  console.log(`MWGL server listening on http://localhost:${port}`);
+  console.log(`Open the UI in your browser: http://localhost:${port}/`);
+});
+
+server.on("error", (err) => {
+  if (err.code === "EADDRINUSE") {
+    console.error(
+      `\n端口 ${port} 已被占用，前端页面可能已在运行。\n` +
+        `请直接在浏览器打开: http://localhost:${port}/\n` +
+        `若需重启服务，先结束占用进程，例如: fuser -k ${port}/tcp  或  kill $(lsof -t -i:${port})\n`
+    );
+    process.exit(1);
+  }
+  throw err;
 });

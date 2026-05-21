@@ -18,5 +18,7 @@ export const state = {
   canvasScale: 1,
   pendingCenterViewport: true,
   pseudocode: "",
+  pseudoMainFlow: "",
+  pseudoNodeFiles: {},
   code: ""
 };

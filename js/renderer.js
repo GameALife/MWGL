@@ -28,6 +28,10 @@ export function createRenderer(elements) {
   const NODE_HEIGHT = NODE_LAYOUT_HEIGHT;
 
   const worldEl = elements.canvasWorld;
+  if (worldEl) {
+    worldEl.style.width = `${INNER_WIDTH}px`;
+    worldEl.style.height = `${INNER_HEIGHT}px`;
+  }
   const labelRelayout = {
     attempts: 0,
     signature: "",

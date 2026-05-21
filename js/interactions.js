@@ -19,6 +19,11 @@ import {
 import { createLoopEditor } from "./loop-editor.js";
 import { bindHighlightScroll, syncCodeHighlight, syncPseudoHighlight } from "./node-highlight.js";
 import { GEN_MODES, buildIncrementalWorkflowPrompt, getGenModeMeta } from "./gen-modes.js";
+import {
+  deriveSessionNameFromPrompt,
+  isAutoSessionName,
+  uniqueSessionName
+} from "./session-naming.js";
 import { state, uid } from "./state.js";
 import { NODE_LAYOUT_HEIGHT, NODE_LAYOUT_WIDTH, WORLD_HEIGHT, WORLD_WIDTH, screenToUser } from "./viewport.js";
 
@@ -29,11 +34,13 @@ export function bindInteractions(elements, renderer) {
   const SVG_NS = "http://www.w3.org/2000/svg";
   let linking = null;
   let panning = null;
-  const MIN_SCALE = 0.4;
+  const MIN_SCALE = 0.25;
   const MAX_SCALE = 2.4;
   const SESSION_STORAGE_KEY = "mwgl_sessions_v1";
+  const SESSIONS_EXPORT_VERSION = 1;
   let sessions = [];
   let activeSessionId = "";
+  let serverHealth = { hasKey: false, hasQwen: false };
 
   function createBlankWorkflow() {
     return {
@@ -53,7 +60,12 @@ export function bindInteractions(elements, renderer) {
     return `窗口 ${index}`;
   }
 
-  function createSessionPayload(name = "新窗口") {
+  function defaultSessionViewport() {
+    return { canvasOffset: { x: 0, y: 0 }, canvasScale: 1 };
+  }
+
+  function createSessionPayload(name = "新工作流") {
+    const { canvasOffset, canvasScale } = defaultSessionViewport();
     return {
       id: uid("s_"),
       name,
@@ -64,8 +76,138 @@ export function bindInteractions(elements, renderer) {
       pseudocode: "",
       code: "",
       codeLanguage: elements.codeLanguage?.value || "Python",
-      runResult: ""
+      runResult: "",
+      canvasOffset,
+      canvasScale,
+      lastUserPrompt: "",
+      activeTab: "node-editor",
+      top2Review: null,
+      runCheckUi: null
     };
+  }
+
+  function normalizeTop2Review(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    const base = String(raw.base || "").trim();
+    const prompt = String(raw.prompt || "").trim();
+    if (!base || !prompt) return null;
+    const phase = raw.phase === "confirm" ? "confirm" : "initial";
+    return {
+      base,
+      prompt,
+      searchMode: raw.searchMode === "mcts" ? "mcts" : "beam",
+      originalPrompt: String(raw.originalPrompt || prompt),
+      phase,
+      finalNotes: String(raw.finalNotes || "")
+    };
+  }
+
+  function getTop2Review() {
+    return normalizeTop2Review(getActiveSession()?.top2Review);
+  }
+
+  function setTop2Review(data) {
+    const cur = getActiveSession();
+    if (!cur) return;
+    cur.top2Review = data ? normalizeTop2Review(data) : null;
+  }
+
+  function maybeAutoNameSession(prompt) {
+    const cur = getActiveSession();
+    if (!cur || !String(prompt || "").trim()) return;
+    if (!isAutoSessionName(cur.name)) return;
+    const base = deriveSessionNameFromPrompt(prompt);
+    const others = sessions.filter((s) => s.id !== cur.id).map((s) => s.name);
+    cur.name = uniqueSessionName(base, others);
+    if (elements.sessionTitle) elements.sessionTitle.value = cur.name;
+    renderSessionList();
+    document.title = `${cur.name} - MWGL Studio v3`;
+  }
+
+  function captureRunCheckUi() {
+    const summary = elements.runCheckSummary;
+    if (!summary || summary.classList.contains("hidden")) return null;
+    const passed = summary.classList.contains("pass");
+    return {
+      passed,
+      summaryText: summary.textContent || "",
+      badgeText: elements.codeCheckBadge?.textContent || "",
+      badgePassed: elements.codeCheckBadge?.classList.contains("pass")
+    };
+  }
+
+  function restoreRunCheckUi(data) {
+    if (!elements.runCheckSummary || !elements.codeCheckBadge) return;
+    if (!data) {
+      elements.runCheckSummary.classList.add("hidden");
+      elements.runCheckSummary.classList.remove("pass", "fail");
+      elements.codeCheckBadge.classList.add("hidden");
+      elements.codeCheckBadge.classList.remove("pass", "fail");
+      return;
+    }
+    elements.runCheckSummary.classList.remove("hidden", "pass", "fail");
+    elements.runCheckSummary.classList.add(data.passed ? "pass" : "fail");
+    elements.runCheckSummary.textContent =
+      data.summaryText ||
+      (data.passed
+        ? "运行检测通过：语法校验与执行均正常。"
+        : "运行检测未通过。可查看日志或点击「根据报错修复」再次尝试。");
+    elements.codeCheckBadge.classList.remove("hidden", "pass", "fail");
+    elements.codeCheckBadge.classList.add(data.badgePassed ? "pass" : "fail");
+    elements.codeCheckBadge.textContent =
+      data.badgeText || (data.badgePassed ? "✓ 运行检测通过" : "✗ 运行检测未通过");
+  }
+
+  function getActiveTabId() {
+    const active = document.querySelector(".tab-btn.active");
+    return active?.dataset?.tab || "node-editor";
+  }
+
+  function setActiveTabId(tabId) {
+    const btn = document.querySelector(`.tab-btn[data-tab="${tabId}"]`);
+    if (!btn) return;
+    btn.click();
+  }
+
+  function saveSessionUiState() {
+    const cur = getActiveSession();
+    if (!cur) return;
+    cur.canvasOffset = {
+      x: Number(state.canvasOffset?.x) || 0,
+      y: Number(state.canvasOffset?.y) || 0
+    };
+    cur.canvasScale = Number.isFinite(state.canvasScale) ? state.canvasScale : 1;
+    cur.activeTab = getActiveTabId();
+    cur.lastUserPrompt = String(cur.lastUserPrompt || "");
+    const top2 = getTop2Review();
+    if (top2 && humanReviewPanelEl && !humanReviewPanelEl.classList.contains("hidden")) {
+      cur.top2Review = {
+        ...top2,
+        finalNotes: humanReviewFinalInputEl?.value?.trim() || top2.finalNotes || ""
+      };
+    } else if (!top2) {
+      cur.top2Review = null;
+    }
+    cur.runCheckUi = captureRunCheckUi();
+  }
+
+  function restoreTop2ReviewUi(review) {
+    humanReviewPanelEl?.classList.add("hidden");
+    humanReviewToolbarEl?.classList.add("hidden");
+    if (humanReviewListEl) humanReviewListEl.innerHTML = "";
+    if (!review) return;
+    setTop2Review(review);
+    humanReviewPanelEl?.classList.remove("hidden");
+    setHumanReviewStepUi(review.phase);
+    if (humanReviewFinalInputEl) {
+      humanReviewFinalInputEl.value = review.finalNotes || "";
+    }
+    if (review.phase === "confirm") {
+      loadHumanReviewSuggestions(state.workflow, review.prompt, review.base);
+    }
+    requestAnimationFrame(() => {
+      humanReviewPanelEl?.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
+    });
   }
 
   function getActiveSession() {
@@ -161,6 +303,7 @@ export function bindInteractions(elements, renderer) {
     cur.code = elements.codeText.value || "";
     cur.codeLanguage = elements.codeLanguage.value || "Python";
     cur.runResult = elements.runResultText.value || "";
+    saveSessionUiState();
   }
 
   function persistSessions() {
@@ -200,7 +343,14 @@ export function bindInteractions(elements, renderer) {
     state.workflow = cloneWorkflow(session.workflow);
     state.selectedNodeId = state.workflow.nodes[0]?.id || null;
     state.selectedEdgeId = null;
-    state.pendingCenterViewport = true;
+    state.drag = null;
+    linking = null;
+    panning = null;
+    state.canvasOffset = session.canvasOffset
+      ? { x: Number(session.canvasOffset.x) || 0, y: Number(session.canvasOffset.y) || 0 }
+      : { x: 0, y: 0 };
+    state.canvasScale = Number.isFinite(session.canvasScale) ? session.canvasScale : 1;
+    state.pendingCenterViewport = false;
     if (elements.sessionTitle) elements.sessionTitle.value = session.name || "";
     elements.userPrompt.value = session.prompt || "";
     elements.pseudocodeText.value = session.pseudocode || "";
@@ -210,10 +360,14 @@ export function bindInteractions(elements, renderer) {
     state.pseudocode = session.pseudocode || "";
     state.code = session.code || "";
     document.title = `${session.name || "工作流"} - MWGL Studio v3`;
+    restoreRunCheckUi(session.runCheckUi || null);
     render();
+    applyViewportTransform?.();
     renderSessionList();
     updateHistoryButtons();
     syncGenModeUi();
+    setActiveTabId(session.activeTab || "node-editor");
+    restoreTop2ReviewUi(normalizeTop2Review(session.top2Review));
   }
 
   function switchSession(nextId) {
@@ -262,18 +416,7 @@ export function bindInteractions(elements, renderer) {
     }
     const loadedSessions = Array.isArray(loaded?.sessions) ? loaded.sessions : [];
     sessions = loadedSessions.length
-      ? loadedSessions.map((s, idx) => ({
-          id: String(s.id || uid("s_")),
-          name: String(s.name || newSessionName(idx + 1)),
-          prompt: String(s.prompt || ""),
-          workflow: cloneWorkflow(s.workflow || createBlankWorkflow()),
-          undoStack: Array.isArray(s.undoStack) ? s.undoStack.map((wf) => cloneWorkflow(wf)) : [],
-          redoStack: Array.isArray(s.redoStack) ? s.redoStack.map((wf) => cloneWorkflow(wf)) : [],
-          pseudocode: String(s.pseudocode || ""),
-          code: String(s.code || ""),
-          codeLanguage: String(s.codeLanguage || "Python"),
-          runResult: String(s.runResult || "")
-        }))
+      ? loadedSessions.map((s, idx) => mapImportedSession(s, idx))
       : [createSessionPayload(newSessionName(1))];
     activeSessionId = String(loaded?.activeSessionId || sessions[0].id);
     if (!sessions.some((s) => s.id === activeSessionId)) activeSessionId = sessions[0].id;
@@ -291,8 +434,18 @@ export function bindInteractions(elements, renderer) {
       const res = await fetch(`${base}/api/health`);
       const data = await res.json();
       if (data.ok) {
+        serverHealth = {
+          hasKey: Boolean(data.hasKey),
+          hasQwen: Boolean(data.hasQwen)
+        };
         indicator.className = "status-indicator online";
-        textEl.textContent = data.hasKey ? "API 已连接" : "未配置密钥";
+        if (!data.hasKey) {
+          textEl.textContent = "未配置 DeepSeek";
+        } else if (!data.hasQwen) {
+          textEl.textContent = "已连接（无 Qwen，Top-2 将跳过）";
+        } else {
+          textEl.textContent = "API 已连接";
+        }
       } else {
         throw new Error("API 异常");
       }
@@ -311,9 +464,139 @@ export function bindInteractions(elements, renderer) {
         const panel = document.getElementById(`tab-${btn.dataset.tab}`);
         if (panel) panel.classList.add("active");
         const tab = btn.dataset.tab;
+        const cur = getActiveSession();
+        if (cur && tab) {
+          cur.activeTab = tab;
+          persistSessions();
+        }
         if (tab === "pseudo") syncPseudoHighlight(elements, state.workflow);
         if (tab === "code") syncCodeHighlight(elements, state.workflow);
       });
+    });
+  }
+
+  function mapImportedSession(s, idx) {
+    const vp = defaultSessionViewport();
+    const off = s.canvasOffset && typeof s.canvasOffset === "object" ? s.canvasOffset : vp.canvasOffset;
+    return {
+      id: String(s.id || uid("s_")),
+      name: String(s.name || newSessionName(idx + 1)),
+      prompt: String(s.prompt || ""),
+      workflow: cloneWorkflow(s.workflow || createBlankWorkflow()),
+      undoStack: Array.isArray(s.undoStack) ? s.undoStack.map((wf) => cloneWorkflow(wf)) : [],
+      redoStack: Array.isArray(s.redoStack) ? s.redoStack.map((wf) => cloneWorkflow(wf)) : [],
+      pseudocode: String(s.pseudocode || ""),
+      code: String(s.code || ""),
+      codeLanguage: String(s.codeLanguage || "Python"),
+      runResult: String(s.runResult || ""),
+      canvasOffset: { x: Number(off.x) || 0, y: Number(off.y) || 0 },
+      canvasScale: Number.isFinite(s.canvasScale) ? s.canvasScale : 1,
+      lastUserPrompt: String(s.lastUserPrompt || ""),
+      activeTab: String(s.activeTab || "node-editor"),
+      top2Review: normalizeTop2Review(s.top2Review),
+      runCheckUi: s.runCheckUi && typeof s.runCheckUi === "object" ? s.runCheckUi : null
+    };
+  }
+
+  function exportAllSessions() {
+    saveCurrentSessionSnapshot();
+    const payload = {
+      version: SESSIONS_EXPORT_VERSION,
+      exportedAt: new Date().toISOString(),
+      activeSessionId,
+      sessions
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `mwgl-sessions-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    setStatus("已导出全部窗口数据。");
+  }
+
+  function applyImportedSessions(data) {
+    const list = Array.isArray(data?.sessions) ? data.sessions : [];
+    if (!list.length) throw new Error("文件中没有会话数据");
+    sessions = list.map((s, idx) => mapImportedSession(s, idx));
+    activeSessionId = String(data.activeSessionId || sessions[0].id);
+    if (!sessions.some((s) => s.id === activeSessionId)) activeSessionId = sessions[0].id;
+    const target = sessions.find((s) => s.id === activeSessionId) || sessions[0];
+    applySession(target);
+    persistSessions();
+    updateHistoryButtons();
+    setStatus(`已导入 ${sessions.length} 个窗口。`);
+  }
+
+  function bindTopNavActions() {
+    const settingsModal = document.getElementById("settingsModal");
+    const settingsApiBase = document.getElementById("settingsApiBase");
+    const settingsPostOptimize = document.getElementById("settingsPostOptimize");
+    const importFile = document.getElementById("importSessionsFile");
+
+    const closeSettings = () => settingsModal?.classList.add("hidden");
+
+    document.getElementById("btnSettings")?.addEventListener("click", () => {
+      if (!settingsModal) return;
+      if (settingsApiBase) settingsApiBase.value = elements.apiBase?.value || "";
+      if (settingsPostOptimize && selectPostOptimizeEl) {
+        settingsPostOptimize.value = selectPostOptimizeEl.value;
+      }
+      settingsModal.classList.remove("hidden");
+    });
+
+    document.querySelectorAll("[data-close-settings]").forEach((el) => {
+      el.addEventListener("click", closeSettings);
+    });
+
+    document.getElementById("btnSaveSettings")?.addEventListener("click", () => {
+      if (settingsApiBase && elements.apiBase) {
+        elements.apiBase.value = settingsApiBase.value.trim();
+        localStorage.setItem("mwgl_api_base", elements.apiBase.value);
+      }
+      if (settingsPostOptimize && selectPostOptimizeEl) {
+        selectPostOptimizeEl.value = settingsPostOptimize.value;
+        localStorage.setItem("mwgl_post_optimize", selectPostOptimizeEl.value);
+        syncOptimizeUi();
+        syncGenModeUi();
+      }
+      closeSettings();
+      checkApiStatus();
+      setStatus("设置已保存。");
+    });
+
+    document.getElementById("btnClearAllSessions")?.addEventListener("click", () => {
+      if (!confirm("确定清空全部窗口？将保留一个空白窗口，此操作不可撤销。")) return;
+      sessions = [createSessionPayload("新工作流")];
+      activeSessionId = sessions[0].id;
+      applySession(sessions[0]);
+      persistSessions();
+      updateHistoryButtons();
+      closeSettings();
+      setStatus("已清空全部窗口数据。");
+    });
+
+    document.getElementById("btnExportAll")?.addEventListener("click", exportAllSessions);
+
+    document.getElementById("btnImport")?.addEventListener("click", () => {
+      importFile?.click();
+    });
+
+    importFile?.addEventListener("change", async () => {
+      const file = importFile.files?.[0];
+      importFile.value = "";
+      if (!file) return;
+      try {
+        const text = await file.text();
+        const data = JSON.parse(text);
+        if (!confirm(`将导入 ${Array.isArray(data.sessions) ? data.sessions.length : 0} 个窗口并覆盖当前数据，是否继续？`)) {
+          return;
+        }
+        applyImportedSessions(data);
+      } catch (err) {
+        setStatus(`导入失败：${err.message}`, true);
+      }
     });
   }
 
@@ -469,9 +752,6 @@ export function bindInteractions(elements, renderer) {
   const btnContinueOptimizeToolbarEl = document.getElementById("btnContinueOptimizeToolbar");
   const selectGenModeEl = document.getElementById("selectGenMode");
   const genModeHintEl = document.getElementById("genModeHint");
-  let pendingTop2Optimize = null;
-  let humanReviewPhase = null;
-
   function syncOptimizeUi() {
     const enabled = selectPostOptimizeEl?.value === "top4";
     if (selectTop4SearchModeEl) {
@@ -483,9 +763,12 @@ export function bindInteractions(elements, renderer) {
       return;
     }
     const mcts = selectTop4SearchModeEl?.value === "mcts";
+    const qwenNote = serverHealth.hasQwen
+      ? "（需 QWEN_*）"
+      : "（未配置 Qwen 时将自动跳过优化）";
     optimizeHintEl.textContent = mcts
-      ? "Top-2：重新生成工作流后须 ① 初次修改 → ② 最终确认，再补初稿并 MCTS（需 QWEN_*）。"
-      : "Top-2：重新生成工作流后须 ① 初次修改 → ② 最终确认，再补初稿并束搜索（需 QWEN_*）。";
+      ? `Top-2：重新生成后须 ① 初次修改 → ② 最终确认，再 MCTS${qwenNote}。`
+      : `Top-2：重新生成后须 ① 初次修改 → ② 最终确认，再束搜索${qwenNote}。`;
   }
 
   function syncHumanReviewToolbar(phase) {
@@ -503,7 +786,11 @@ export function bindInteractions(elements, renderer) {
   }
 
   function setHumanReviewStepUi(phase) {
-    humanReviewPhase = phase;
+    const review = getTop2Review();
+    if (review) {
+      review.phase = phase;
+      setTop2Review(review);
+    }
     hrStep1BadgeEl?.classList.toggle("hr-step-active", phase === "initial");
     hrStep1BadgeEl?.classList.toggle("hr-step-done", phase === "confirm");
     hrStep2BadgeEl?.classList.toggle("hr-step-active", phase === "confirm");
@@ -513,9 +800,8 @@ export function bindInteractions(elements, renderer) {
     syncHumanReviewToolbar(phase);
   }
 
-  function hideHumanReviewPanel() {
-    pendingTop2Optimize = null;
-    humanReviewPhase = null;
+  function hideHumanReviewPanel(clearStored = true) {
+    if (clearStored) setTop2Review(null);
     humanReviewPanelEl?.classList.add("hidden");
     humanReviewToolbarEl?.classList.add("hidden");
     if (humanReviewListEl) humanReviewListEl.innerHTML = "";
@@ -575,8 +861,9 @@ export function bindInteractions(elements, renderer) {
   }
 
   async function finishInitialEditPhase() {
-    if (!pendingTop2Optimize) return;
-    const { base, prompt } = pendingTop2Optimize;
+    const review = getTop2Review();
+    if (!review) return;
+    const { base, prompt } = review;
     const errs = constraintErrors(state.workflow);
     if (errs.length) {
       return setStatus(
@@ -595,8 +882,16 @@ export function bindInteractions(elements, renderer) {
   }
 
   function startHumanReviewAfterGenerate(workflow, prompt, base, searchMode) {
-    pendingTop2Optimize = { base, prompt, searchMode, originalPrompt: prompt };
+    setTop2Review({
+      base,
+      prompt,
+      searchMode,
+      originalPrompt: prompt,
+      phase: "initial",
+      finalNotes: ""
+    });
     showHumanReviewPhaseInitial();
+    persistActiveSessionNow();
     setStatus(
       "首图已生成。① 在画布改图 → 点蓝条或工具栏绿色「确认初次修改」；② 填意见 → 点「确认意见并开始 Top-2」。",
       false
@@ -604,11 +899,18 @@ export function bindInteractions(elements, renderer) {
   }
 
   async function continueTop2Optimize() {
-    if (!pendingTop2Optimize) return;
-    if (humanReviewPhase !== "confirm") {
+    const review = getTop2Review();
+    if (!review) return;
+    if (review.phase !== "confirm") {
       return setStatus("请先完成「初次修改」并进入「最终确认」。", true);
     }
-    const { base, prompt, searchMode, originalPrompt } = pendingTop2Optimize;
+    await checkApiStatus();
+    if (!serverHealth.hasQwen) {
+      hideHumanReviewPanel();
+      persistActiveSessionNow();
+      return setStatus("未配置 Qwen（QWEN_API_KEY / QWEN_BASE_URL），已跳过 Top-2 优化，保留当前画布。", false);
+    }
+    const { base, prompt, searchMode, originalPrompt } = review;
     const finalNotes = humanReviewFinalInputEl?.value?.trim() || "";
     const optimizePrompt = buildOptimizePrompt(originalPrompt || prompt, finalNotes);
     const modeLabel = searchMode === "mcts" ? "MCTS" : "束搜索";
@@ -620,7 +922,7 @@ export function bindInteractions(elements, renderer) {
       );
     }
     hideHumanReviewPanel();
-    setStatus(`正在 Top-2 ${modeLabel}（以当前图为种子，补 3 张初稿并搜索，需 Qwen）...`);
+    setStatus(`正在 Top-2 ${modeLabel}（以当前图为种子，补 3 张初稿并搜索）...`);
     try {
       const evalDataset = await fetchEvalDataset({ base });
       const workflow = await optimizeWorkflow({
@@ -649,7 +951,12 @@ export function bindInteractions(elements, renderer) {
         persistSessions();
       }
     } catch (optErr) {
-      setStatus(`Top-2 ${modeLabel} 失败：${optErr.message}`, true);
+      const msg = String(optErr.message || optErr);
+      if (/QWEN|Qwen|422|optimize requires/i.test(msg)) {
+        setStatus("Top-2 不可用（未配置 Qwen），已保留当前画布。", false);
+      } else {
+        setStatus(`Top-2 ${modeLabel} 失败：${msg}`, true);
+      }
     }
   }
 
@@ -1052,7 +1359,8 @@ export function bindInteractions(elements, renderer) {
       setStatus("Top-2：将重新生成首图，并须完成「初次修改」→「最终确认」后才能搜索。", false);
     }
 
-    const previousPrompt = String(localStorage.getItem("mwgl_last_user_prompt") || "").trim();
+    const cur = getActiveSession();
+    const previousPrompt = String(cur?.lastUserPrompt || "").trim();
     const effectivePrompt = meta.incremental
       ? buildIncrementalWorkflowPrompt(prompt, state.workflow, previousPrompt)
       : prompt;
@@ -1061,42 +1369,41 @@ export function bindInteractions(elements, renderer) {
     setStatus(`正在${meta.label}…`);
 
     try {
-      let workflow = await buildWorkflowByDeepSeek({ base, prompt: effectivePrompt });
+      const workflow = await buildWorkflowByDeepSeek({ base, prompt: effectivePrompt });
+      if (cur) cur.lastUserPrompt = prompt;
 
-      const postOpt = selectPostOptimizeEl?.value || "none";
-      let optFail = "";
-      let optDone = false;
-      let optTail = "";
-      if (postOpt === "top4") {
+      const postOptAfter = selectPostOptimizeEl?.value || "none";
+      recordWorkflowCheckpoint();
+      state.workflow = workflow;
+      state.selectedNodeId = state.workflow.nodes[0]?.id || null;
+      state.selectedEdgeId = null;
+      state.pendingCenterViewport = true;
+      maybeAutoNameSession(prompt);
+      render();
+      persistActiveSessionNow();
+
+      if (postOptAfter === "top4") {
+        await checkApiStatus();
+        if (!serverHealth.hasQwen) {
+          hideHumanReviewPanel();
+          const errs = constraintErrors(workflow);
+          const msg = errs.length
+            ? `已生成（未配置 Qwen，已跳过 Top-2）：${formatConstraintErrors(errs)}`
+            : "已生成 MWGL（未配置 Qwen，已跳过 Top-2 优化）。";
+          setStatus(msg, Boolean(errs.length));
+          return;
+        }
         const searchMode = selectTop4SearchModeEl?.value === "mcts" ? "mcts" : "beam";
-        localStorage.setItem("mwgl_last_user_prompt", prompt);
-        recordWorkflowCheckpoint();
-        state.workflow = workflow;
-        state.selectedNodeId = state.workflow.nodes[0]?.id || null;
-        state.selectedEdgeId = null;
-        state.pendingCenterViewport = true;
-        render();
-        persistActiveSessionNow();
         startHumanReviewAfterGenerate(workflow, prompt, base, searchMode);
         return;
       }
 
       hideHumanReviewPanel();
-      recordWorkflowCheckpoint();
-      state.workflow = workflow;
-      localStorage.setItem("mwgl_last_user_prompt", prompt);
-      state.selectedNodeId = state.workflow.nodes[0]?.id || null;
-      state.selectedEdgeId = null;
-      state.pendingCenterViewport = true;
-      render();
-      persistActiveSessionNow();
       const errs = constraintErrors(workflow);
-      const tail = optDone ? optTail : "";
-      const msg =
-        errs.length
-          ? `已生成并渲染${tail}（草稿态，最终导出前请修复）：${formatConstraintErrors(errs)}`
-          : `已生成 MWGL 并渲染到画布${tail}。`;
-      setStatus(optFail ? `${msg}${optFail}` : msg, Boolean(optFail));
+      const msg = errs.length
+        ? `已生成并渲染（草稿态，最终导出前请修复）：${formatConstraintErrors(errs)}`
+        : "已生成 MWGL 并渲染到画布。";
+      setStatus(msg, Boolean(errs.length));
     } catch (error) {
       setStatus(`生成失败：${error.message}`, true);
     }
@@ -1117,15 +1424,17 @@ export function bindInteractions(elements, renderer) {
     setStatus(`正在${meta.label}…`);
 
     try {
-      const pseudocode = await dagToPseudocode({
+      const pseudoResult = await dagToPseudocode({
         base,
         workflow,
         mode: meta.incremental ? "incremental" : "regen",
         existingPseudocode: meta.incremental ? elements.pseudocodeText.value : "",
         revisionNotes: getRevisionNotes()
       });
-      state.pseudocode = pseudocode;
-      elements.pseudocodeText.value = pseudocode;
+      state.pseudocode = pseudoResult.content;
+      state.pseudoMainFlow = pseudoResult.mainFlow;
+      state.pseudoNodeFiles = pseudoResult.nodeFiles;
+      elements.pseudocodeText.value = pseudoResult.content;
       syncPseudoHighlight(elements, workflow);
       persistActiveSessionNow();
       setStatus("已生成伪代码。");
@@ -1153,6 +1462,8 @@ export function bindInteractions(elements, renderer) {
       const code = await pseudoToCode({
         base,
         pseudocode,
+        mainFlow: state.pseudoMainFlow,
+        nodeFiles: state.pseudoNodeFiles,
         language,
         workflow: state.workflow,
         mode: meta.incremental ? "incremental" : "regen",
@@ -1354,6 +1665,7 @@ export function bindInteractions(elements, renderer) {
     window.addEventListener("pointerup", (event) => {
       if (panning) {
         panning = null;
+        persistActiveSessionNow();
       }
       if (linking) {
         const targetEl = event.target.closest ? event.target.closest(".node") : null;
@@ -1476,6 +1788,7 @@ export function bindInteractions(elements, renderer) {
       };
       state.canvasScale = nextScale;
       applyViewportTransform();
+      persistActiveSessionNow();
     }, { passive: false });
   }
 
@@ -1542,7 +1855,9 @@ export function bindInteractions(elements, renderer) {
     if (newSessionBtn) {
       newSessionBtn.addEventListener("click", () => {
         saveCurrentSessionSnapshot();
-        const next = createSessionPayload(`工作流 ${sessions.length + 1}`);
+        const next = createSessionPayload(
+          uniqueSessionName("新工作流", sessions.map((s) => s.name))
+        );
         sessions.unshift(next);
         activeSessionId = next.id;
         applySession(next);
@@ -1637,6 +1952,7 @@ export function bindInteractions(elements, renderer) {
   bootstrapSessions();
   updateHistoryButtons();
   bindActions();
+  bindTopNavActions();
   bindCanvasEvents();
   bindEdgeEvents();
   initTabs();
