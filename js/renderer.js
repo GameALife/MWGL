@@ -1,5 +1,5 @@
 import { state } from "./state.js";
-import { workflowToMwgl } from "./mwgl.js";
+import { parallelJoinStatus, validateWorkflowConstraints, workflowToMwgl } from "./mwgl.js";
 import { buildLoopPreviewHtml } from "./loop-preview.js";
 import { syncCodeHighlight, syncPseudoHighlight } from "./node-highlight.js";
 import {
@@ -124,10 +124,18 @@ export function createRenderer(elements) {
     const defs = edgeLayer.querySelector("defs");
     edgeLayer.innerHTML = "";
     if (defs) edgeLayer.appendChild(defs);
+    const nodeMap = new Map(nodes.map((n) => [n.id, n]));
     const geometries = computeEdgeGeometries(nodes, edges);
     edges.forEach((edge) => {
       const geom = geometries.get(edge.id);
       if (!geom) return;
+      const fromType = nodeMap.get(edge.from)?.type || "";
+      const forkKind =
+        fromType === "parallel"
+          ? " edge-from-parallel"
+          : fromType === "branch"
+            ? " edge-from-branch"
+            : "";
 
       const hit = document.createElementNS(SVG_NS, "path");
       hit.setAttribute("d", geom.d);
@@ -137,7 +145,10 @@ export function createRenderer(elements) {
 
       const line = document.createElementNS(SVG_NS, "path");
       line.setAttribute("d", geom.d);
-      line.setAttribute("class", `edge-line${state.selectedEdgeId === edge.id ? " selected" : ""}`);
+      line.setAttribute(
+        "class",
+        `edge-line${forkKind}${state.selectedEdgeId === edge.id ? " selected" : ""}`
+      );
       line.setAttribute("marker-end", "url(#arrow-head)");
       line.dataset.edgeId = edge.id;
       edgeLayer.appendChild(line);
@@ -280,6 +291,82 @@ export function createRenderer(elements) {
     }
   }
 
+  function syncEdgeLabelField() {
+    const fromId = elements.edgeFrom?.value || "";
+    const fromNode = state.workflow.nodes?.find((n) => n.id === fromId);
+    const t = fromNode?.type || "";
+    const cap = elements.edgeLabelCaption;
+    const hint = elements.edgeLabelHint;
+    const input = elements.edgeLabel;
+    if (t === "branch") {
+      if (cap) cap.textContent = "条件标签";
+      if (hint) hint.textContent = "可判定业务条件，如：已认证、金额>1000、否";
+      if (input) input.placeholder = "例如：是、否、已认证";
+    } else if (t === "parallel") {
+      if (cap) cap.textContent = "并行臂名称";
+      if (hint) hint.textContent = "各臂同时执行，须汇合到同一 step；如：扣库存、发券";
+      if (input) input.placeholder = "例如：并行分支A、扣库存";
+    } else {
+      if (cap) cap.textContent = "连线标签";
+      if (hint) hint.textContent = "非 branch/parallel 出发通常可留空";
+      if (input) input.placeholder = "可选";
+    }
+  }
+
+  function syncForkNodeHints(node) {
+    const row = elements.forkHintRow;
+    const text = elements.forkHintText;
+    if (!row || !text) return;
+    if (!node || (node.type !== "branch" && node.type !== "parallel")) {
+      row.classList.add("hidden");
+      return;
+    }
+    row.classList.remove("hidden");
+    if (node.type === "branch") {
+      text.textContent =
+        "条件分支：每条出边为一种可判定条件，运行时择一执行。出边 label 写条件语义（禁纯数字/分支N）。";
+    } else {
+      const join = parallelJoinStatus(state.workflow).get(node.id);
+      const joinNote = join?.ok
+        ? `已汇合 → ${join.joinId}`
+        : "⚠ 各臂尚未汇合到同一节点，请让各臂下游连到同一 step";
+      text.textContent = `并行分支：各臂同时执行，最后须汇合。${joinNote}`;
+    }
+  }
+
+  function syncNodeTextPlaceholder(node) {
+    if (!elements.nodeText) return;
+    const t = node?.type || "step";
+    const placeholders = {
+      start: "入口事件，如：收到订单创建请求",
+      step: "动词+对象，如：校验订单参数",
+      branch: "判断什么条件，如：是否已实名认证",
+      parallel: "并行业务目的，如：并行扣库存与发券",
+      end: "终态说明；failure 须写具体失败原因"
+    };
+    elements.nodeText.placeholder = placeholders[t] || placeholders.step;
+  }
+
+  function refreshConstraintPanel(workflow) {
+    const result = validateWorkflowConstraints(workflow);
+    const items = (result.errors || []).map((msg) => {
+      const m = String(msg).match(/(?:parallel|branch|step|start|end)?\s*节点\s+(\S+)/);
+      const nodeId = m?.[1]?.replace(/[，。]/g, "") || null;
+      return {
+        message: msg,
+        onLocate: nodeId
+          ? () => {
+              state.selectedNodeId = nodeId;
+              state.selectedEdgeId = null;
+              render();
+              setStatus(`已定位节点 ${nodeId}`);
+            }
+          : undefined
+      };
+    });
+    setConstraintErrors(items);
+  }
+
   function syncEdgeEditor() {
     const nodes = state.workflow.nodes || [];
     const edges = state.workflow.edges || [];
@@ -305,6 +392,7 @@ export function createRenderer(elements) {
     } else {
       state.selectedEdgeId = null;
     }
+    syncEdgeLabelField();
   }
 
   function setStatus(text, isError = false) {
@@ -353,6 +441,7 @@ export function createRenderer(elements) {
       elements.nodeX.value = "";
       elements.nodeY.value = "";
       if (elements.endOutcomeRow) elements.endOutcomeRow.classList.add("hidden");
+      syncForkNodeHints(null);
       return;
     }
     elements.nodeType.value = node.type;
@@ -364,6 +453,8 @@ export function createRenderer(elements) {
       elements.endOutcomeRow.classList.toggle("hidden", !isEnd);
       if (isEnd) elements.nodeOutcome.value = node.outcome === "failure" ? "failure" : "success";
     }
+    syncForkNodeHints(node);
+    syncNodeTextPlaceholder(node);
   }
 
   function render() {
@@ -385,12 +476,16 @@ export function createRenderer(elements) {
     }
     worldEl.innerHTML = "";
     ensureEdgeLayer();
+    const parJoin = parallelJoinStatus(wf);
     wf.nodes.forEach((node) => {
       const div = document.createElement("div");
       const endClass =
         node.type === "end" ? ` end-${node.outcome === "failure" ? "failure" : "success"}` : "";
       const loopClass = node.loop ? " has-loop" : "";
-      div.className = `node ${node.type}${endClass}${loopClass}${
+      const parJoinInfo = parJoin.get(node.id);
+      const noJoinClass =
+        node.type === "parallel" && parJoinInfo && !parJoinInfo.ok ? " parallel-no-join" : "";
+      div.className = `node ${node.type}${endClass}${loopClass}${noJoinClass}${
         state.selectedNodeId === node.id ? " selected" : ""
       }`;
       div.style.left = `${WORLD_WIDTH / 2 + node.x}px`;
@@ -400,9 +495,21 @@ export function createRenderer(elements) {
       const mainText = node.loop
         ? `<div class="text node-text-main">${escapeHtml(node.text)}</div>`
         : `<div class="text">${escapeHtml(node.text)}</div>`;
+      const typeBadge =
+        node.type === "parallel"
+          ? "parallel · ∥"
+          : node.loop
+            ? `${node.type} · 循环`
+            : node.type;
+      const joinBadge =
+        node.type === "parallel" && parJoinInfo
+          ? parJoinInfo.ok
+            ? `<span class="node-join-badge node-join-ok" title="汇合点 ${parJoinInfo.joinId}">已汇合</span>`
+            : `<span class="node-join-badge node-join-warn" title="各臂须连到同一后续节点">未汇合</span>`
+          : "";
       div.innerHTML = `
         <button class="node-delete" type="button" title="删除节点" aria-label="删除节点">×</button>
-        <div class="type">${node.loop ? `${node.type} · 循环` : node.type}</div>
+        <div class="type">${typeBadge}${joinBadge}</div>
         ${mainText}
         ${loopPreview}
       `;
@@ -433,6 +540,7 @@ export function createRenderer(elements) {
     }
     syncEditor();
     syncEdgeEditor();
+    refreshConstraintPanel(wf);
 
     if (state.pendingCenterViewport) {
       tryApplyPendingCenter();
@@ -474,6 +582,9 @@ export function createRenderer(elements) {
     getSelectedNode,
     syncEditor,
     syncEdgeEditor,
+    syncEdgeLabelField,
+    syncForkNodeHints,
+    syncNodeTextPlaceholder,
     centerWorkflow,
     tryApplyPendingCenter,
     applyViewportTransform,

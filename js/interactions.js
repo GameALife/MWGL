@@ -750,6 +750,14 @@ export function bindInteractions(elements, renderer) {
       }
       return `条件_${uid("").slice(-4)}`;
     }
+    if (fromNode.type === "parallel") {
+      for (let i = 0; i < 26; i += 1) {
+        const letter = String.fromCharCode(65 + i);
+        const opt = `并行分支${letter}`;
+        if (!labels.has(opt)) return opt;
+      }
+      return `并行分支_${uid("").slice(-4)}`;
+    }
     return "";
   }
 
@@ -764,6 +772,7 @@ export function bindInteractions(elements, renderer) {
     start: "开始",
     step: "执行业务步骤",
     branch: "条件判断",
+    parallel: "并行分支",
     end_success: "任务完成",
     end_failure: "任务未达成-条件不满足"
   };
@@ -798,19 +807,73 @@ export function bindInteractions(elements, renderer) {
       outcome = "failure";
     }
 
-    if (type === "branch") {
+    if (type === "branch" || type === "parallel") {
       const x = 120 + Math.floor(Math.random() * 220);
       const y = 120 + Math.floor(Math.random() * 260);
-      const br = { id: uid(), type: "branch", text: defaultTextForType.branch, x, y };
-      const s1 = { id: uid(), type: "step", text: "分支步骤A", x: x + 280, y: y - 48 };
-      const s2 = { id: uid(), type: "step", text: "分支步骤B", x: x + 280, y: y + 48 };
-      state.workflow.nodes.push(br, s1, s2);
+      const isParallel = type === "parallel";
+      const fork = {
+        id: uid(),
+        type,
+        text: defaultTextForType[type],
+        x,
+        y
+      };
+      const s1 = {
+        id: uid(),
+        type: "step",
+        text: isParallel ? "并行臂步骤A" : "分支步骤A",
+        x: x + 280,
+        y: y - 48
+      };
+      const s2 = {
+        id: uid(),
+        type: "step",
+        text: isParallel ? "并行臂步骤B" : "分支步骤B",
+        x: x + 280,
+        y: y + 48
+      };
+      const nodesToAdd = [fork, s1, s2];
+      const edgesToAdd = [
+        {
+          id: uid("e"),
+          from: fork.id,
+          to: s1.id,
+          label: isParallel ? "并行分支A" : "是"
+        },
+        {
+          id: uid("e"),
+          from: fork.id,
+          to: s2.id,
+          label: isParallel ? "并行分支B" : "否"
+        }
+      ];
+      if (isParallel) {
+        const join = {
+          id: uid(),
+          type: "step",
+          text: "汇总并行结果",
+          x: x + 560,
+          y
+        };
+        const endNode = {
+          id: uid(),
+          type: "end",
+          outcome: "success",
+          text: "完成",
+          x: x + 840,
+          y
+        };
+        nodesToAdd.push(join, endNode);
+        edgesToAdd.push(
+          { id: uid("e"), from: s1.id, to: join.id, label: "" },
+          { id: uid("e"), from: s2.id, to: join.id, label: "" },
+          { id: uid("e"), from: join.id, to: endNode.id, label: "" }
+        );
+      }
+      state.workflow.nodes.push(...nodesToAdd);
       state.workflow.edges = state.workflow.edges || [];
-      state.workflow.edges.push(
-        { id: uid("e"), from: br.id, to: s1.id, label: "是" },
-        { id: uid("e"), from: br.id, to: s2.id, label: "否" }
-      );
-      state.selectedNodeId = br.id;
+      state.workflow.edges.push(...edgesToAdd);
+      state.selectedNodeId = fork.id;
       state.selectedEdgeId = null;
       layoutWorkflowLeftToRight(state.workflow);
       state.pendingCenterViewport = true;
@@ -885,7 +948,7 @@ export function bindInteractions(elements, renderer) {
     state.workflow.edges = state.workflow.edges || [];
 
     const fromNodeForLabel = state.workflow.nodes.find((n) => n.id === from);
-    if (!label && fromNodeForLabel?.type === "branch") {
+    if (!label && (fromNodeForLabel?.type === "branch" || fromNodeForLabel?.type === "parallel")) {
       label = guessLabelForEdge(from);
       elements.edgeLabel.value = label;
     }
@@ -921,7 +984,7 @@ export function bindInteractions(elements, renderer) {
     elements.edgeSelect.value = createdEdge.id;
     render();
     persistActiveSessionNow();
-    if (fromNodeForLabel?.type === "branch" && label) {
+    if ((fromNodeForLabel?.type === "branch" || fromNodeForLabel?.type === "parallel") && label) {
       setTimeout(() => focusEdgeLabelInput(), 0);
     }
     setStatus("连线已新增。");
@@ -964,6 +1027,9 @@ export function bindInteractions(elements, renderer) {
   }
 
   function bindEdgeEvents() {
+    elements.edgeFrom?.addEventListener("change", () => {
+      renderer.syncEdgeLabelField?.();
+    });
     elements.edgeSelect.addEventListener("change", () => {
       const selectedEdgeId = elements.edgeSelect.value;
       state.selectedEdgeId = selectedEdgeId || null;
@@ -1540,11 +1606,19 @@ export function bindInteractions(elements, renderer) {
     document.getElementById("addStep").addEventListener("click", () => addNode("step"));
     document.getElementById("addForLoop")?.addEventListener("click", () => addForLoopNode());
     document.getElementById("addBranch").addEventListener("click", () => addNode("branch"));
+    document.getElementById("addParallel")?.addEventListener("click", () => addNode("parallel"));
     document.getElementById("addEndSuccess").addEventListener("click", () => addNode("end_success"));
     document.getElementById("addEndFailure").addEventListener("click", () => addNode("end_failure"));
     elements.nodeType?.addEventListener("change", () => {
+      const ty = elements.nodeType.value;
       if (elements.endOutcomeRow) {
-        elements.endOutcomeRow.classList.toggle("hidden", elements.nodeType.value !== "end");
+        elements.endOutcomeRow.classList.toggle("hidden", ty !== "end");
+      }
+      const node = getSelectedNode();
+      if (node) {
+        const draft = { ...node, type: ty };
+        renderer.syncForkNodeHints?.(draft);
+        renderer.syncNodeTextPlaceholder?.(draft);
       }
     });
     document.getElementById("btnLayoutLr").addEventListener("click", () => {

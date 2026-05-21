@@ -29,7 +29,8 @@ const SYSTEM_PROMPT = `你是 MWGL v3 伪代码文字润色器。
 - start：描述入口事件
 - step（无 loop）：动宾结构，描述具体操作
 - step（有 loop）：单行描述须点明循环业务目的，并呼应 loop.kind 与 loop.condition（例如 while「库存未补足且未超重试上限」）；不要在 JSON 中输出 FOR/WHILE/END 或展开 loop.steps（程序会按 loop.steps 确定性拼装）
-- branch：描述判断内容
+- branch：描述判断内容（条件择一）
+- parallel：描述并行业务目的（多臂同时执行）；各臂具体步骤由程序在 PARALLEL/ARM 块中展开，JSON 仍为单行
 - end + outcome=success：成功终态
 - end + outcome=failure：具体失败终态（禁单独写「失败」）
 
@@ -87,6 +88,19 @@ function assemblePseudocode(workflow, texts) {
           traverse(e.to, indent + 2, conv);
         });
         emit(indent, "END IF");
+        if (conv) traverse(conv, indent, stopBefore);
+        break;
+      }
+
+      case "parallel": {
+        const targets = outs.map((e) => e.to);
+        const conv = findConvergence(targets, outEdges, nodeMap, topoIndex);
+        emit(indent, `PARALLEL  # [${node.id}] ${desc}`);
+        outs.forEach((e) => {
+          emit(indent + 1, `ARM ${e.label || "臂"}  # [${e.id}]`);
+          traverse(e.to, indent + 2, conv);
+        });
+        emit(indent, "END PARALLEL");
         if (conv) traverse(conv, indent, stopBefore);
         break;
       }

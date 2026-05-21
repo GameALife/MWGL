@@ -188,6 +188,7 @@
           <button id="addStep">step</button>
           <button id="addForLoop">for 循环</button>
           <button id="addBranch">branch</button>
+          <button id="addParallel">parallel</button>
           <button id="addEndSuccess">end ✓</button>
           <button id="addEndFailure">end ✗</button>
           <div class="spacer"></div>
@@ -212,7 +213,7 @@
         </div>
         
         <div class="canvas-hint">
-          空白处拖拽平移 | Ctrl+滚轮缩放 | 节点可拖动 | Shift+拖节点连线 | 循环节点内嵌子步骤预览，点击可编辑循环体
+          空白处拖拽平移 | Ctrl+滚轮缩放 | 节点可拖动 | Shift+拖节点连线 | branch 条件择一 · parallel 多臂同时执行且须汇合 · 循环节点点击可编辑循环体
         </div>
       </div>
     </main>
@@ -235,6 +236,7 @@
             <option value="start">start</option>
             <option value="step">step</option>
             <option value="branch">branch</option>
+            <option value="parallel">parallel</option>
             <option value="end">end</option>
           </select>
           
@@ -246,8 +248,12 @@
             </select>
           </div>
           
+          <div id="forkHintRow" class="fork-hint hidden" role="note">
+            <p id="forkHintText" class="fork-hint-text"></p>
+          </div>
+
           <label for="nodeText">节点文本</label>
-          <textarea id="nodeText" placeholder="step：动词+对象；branch：条件说明；end failure：具体失败语义"></textarea>
+          <textarea id="nodeText" placeholder="step：动词+对象；branch：条件说明；parallel：并行说明；end failure：具体失败语义"></textarea>
           
           <div class="grid-2">
             <div>
@@ -271,8 +277,9 @@
           <select id="edgeFrom"></select>
           <label for="edgeTo">连线终点</label>
           <select id="edgeTo"></select>
-          <label for="edgeLabel">分支标签</label>
-          <input id="edgeLabel" placeholder="例如：已认证、金额>1000" />
+          <label for="edgeLabel" id="edgeLabelCaption">连线标签</label>
+          <input id="edgeLabel" placeholder="根据起点节点类型填写" />
+          <p id="edgeLabelHint" class="field-hint"></p>
           <label for="edgeSelect">已有连线</label>
           <select id="edgeSelect"></select>
           

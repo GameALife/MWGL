@@ -1,6 +1,7 @@
 import { uid } from "./ids.js";
 import { alignWorkflowBBoxToOrigin } from "./viewport.js";
 import { normalizeNodeLoop, validateWorkflowLoops } from "./mwgl-loop.js";
+import { findConvergence, topoSort } from "../lib/mwgl-graph-utils.mjs";
 
 /** MWGL v3：可读优先的极简工作流图语言 */
 export const MWGL_VERSION = 3;
@@ -9,11 +10,12 @@ export const MWGL_VERSION = 3;
  * - start：唯一入口
  * - step：顺序动作（含原 case / wait_user；单出边）
  * - branch：条件分支（多出边，label 为条件）
+ * - parallel：并行分支（多出边，label 为臂名称；汇合与代码生成后续实现）
  * - end：终态（outcome: success | failure）
  *
  * 循环：step 上的 loop.steps 树 + subworkflows 子图（不写入主图 edges，保证主图 DAG）。
  */
-export const NODE_TYPES = ["start", "step", "branch", "end"];
+export const NODE_TYPES = ["start", "step", "branch", "parallel", "end"];
 
 const V2_TYPES = new Set([
   "wait_user",
@@ -107,8 +109,11 @@ export function migrateWorkflowV2ToV3(raw) {
     if (t === "failure") {
       return { ...base, type: "end", outcome: "failure", text };
     }
-    if (t === "switch" || t === "parallel") {
-      return { ...base, type: "branch", text: text || (t === "parallel" ? "并行分支" : "条件判断") };
+    if (t === "parallel") {
+      return { ...base, type: "parallel", text: text || "并行分支" };
+    }
+    if (t === "switch") {
+      return { ...base, type: "branch", text: text || "条件判断" };
     }
     if (t === "wait_user") {
       return {
@@ -195,17 +200,20 @@ export function validateWorkflowConstraints(workflow) {
     if (n.type === "start" && (inMap.get(n.id) || []).length > 0) {
       errors.push(`start 节点 ${n.id} 不能有入边。`);
     }
-    if (n.type === "branch") {
+    if (n.type === "branch" || n.type === "parallel") {
+      const kind = n.type;
       if (outs.length < 2) {
-        errors.push(`branch 节点 ${n.id} 至少需要 2 条出边。`);
+        errors.push(`${kind} 节点 ${n.id} 至少需要 2 条出边。`);
       }
       const labels = outs.map((e) => String(e.label || "").trim()).filter(Boolean);
       if (labels.length !== outs.length) {
-        errors.push(`branch 节点 ${n.id} 每条出边须有非空 label。`);
-      } else if (!outs.every((e) => isSemanticEdgeLabel(e.label))) {
+        errors.push(`${kind} 节点 ${n.id} 每条出边须有非空 label。`);
+      } else if (kind === "branch" && !outs.every((e) => isSemanticEdgeLabel(e.label))) {
         errors.push(`branch 节点 ${n.id} 出边 label 须为可判定业务条件（禁纯数字/分支N）。`);
+      } else if (kind === "parallel" && !outs.every((e) => isSemanticEdgeLabel(e.label))) {
+        errors.push(`parallel 节点 ${n.id} 出边 label 须有臂名称语义（禁纯数字/分支N）。`);
       } else if (new Set(labels).size !== labels.length) {
-        errors.push(`branch 节点 ${n.id} 出边 label 不能重复。`);
+        errors.push(`${kind} 节点 ${n.id} 出边 label 不能重复。`);
       }
     }
   }
@@ -257,6 +265,26 @@ export function validateWorkflowConstraints(workflow) {
     }
   }
 
+  const outEdges = new Map(nodes.map((n) => [n.id, []]));
+  for (const e of edges) {
+    if (!nodeMap.has(e.from) || !nodeMap.has(e.to)) continue;
+    outEdges.get(e.from).push(e);
+  }
+  const topoOrder = topoSort(nodes, edges);
+  const topoIndex = new Map(topoOrder.map((id, i) => [id, i]));
+  for (const n of nodes) {
+    if (n.type !== "parallel") continue;
+    const outs = outMap.get(n.id) || [];
+    const targets = outs.map((e) => e.to).filter((id) => nodeMap.has(id));
+    if (targets.length < 2) continue;
+    const conv = findConvergence(targets, outEdges, nodeMap, topoIndex);
+    if (!conv) {
+      errors.push(
+        `parallel 节点 ${n.id} 各臂须汇合到同一后续节点（未找到公共汇合点，请让各臂下游连到同一 step）。`
+      );
+    }
+  }
+
   const loopVal = validateWorkflowLoops(workflow);
   if (!loopVal.ok) errors.push(...loopVal.errors);
 
@@ -281,6 +309,34 @@ export function validateWorkflowConstraints(workflow) {
   return { ok: errors.length === 0, errors };
 }
 
+/** parallel 节点汇合状态（供画布标记） */
+export function parallelJoinStatus(workflow) {
+  const nodes = Array.isArray(workflow?.nodes) ? workflow.nodes : [];
+  const edges = Array.isArray(workflow?.edges) ? workflow.edges : [];
+  const status = new Map();
+  const nodeMap = new Map(nodes.map((n) => [n.id, n]));
+  const outMap = new Map(nodes.map((n) => [n.id, []]));
+  for (const e of edges) {
+    if (!nodeMap.has(e.from) || !nodeMap.has(e.to)) continue;
+    outMap.get(e.from).push(e);
+  }
+  const outEdges = outMap;
+  const topoOrder = topoSort(nodes, edges);
+  const topoIndex = new Map(topoOrder.map((id, i) => [id, i]));
+  for (const n of nodes) {
+    if (n.type !== "parallel") continue;
+    const outs = outMap.get(n.id) || [];
+    const targets = outs.map((e) => e.to).filter((id) => nodeMap.has(id));
+    if (targets.length < 2) {
+      status.set(n.id, { ok: false, joinId: null });
+      continue;
+    }
+    const joinId = findConvergence(targets, outEdges, nodeMap, topoIndex);
+    status.set(n.id, { ok: Boolean(joinId), joinId: joinId || null });
+  }
+  return status;
+}
+
 function normalizeSubworkflowsField(raw, normalizeGraphFn) {
   const out = {};
   if (!raw || typeof raw !== "object") return out;
@@ -300,7 +356,7 @@ function normalizeSubworkflowsField(raw, normalizeGraphFn) {
 }
 
 function typeRank(type) {
-  const order = { start: 0, step: 2, branch: 1, end: 4 };
+  const order = { start: 0, step: 2, branch: 1, parallel: 1, end: 4 };
   return order[type] ?? 5;
 }
 
@@ -389,19 +445,31 @@ function nextUniqueBranchLabel(used, preferred = ["是", "否"]) {
   return `条件_${uid("").slice(-4)}`;
 }
 
-function repairBranchNodes(workflow) {
+function nextUniqueParallelLabel(used) {
+  for (let i = 0; i < 26; i += 1) {
+    const letter = String.fromCharCode(65 + i);
+    const candidate = `并行分支${letter}`;
+    if (!used.has(candidate)) return candidate;
+  }
+  return `并行分支_${uid("").slice(-4)}`;
+}
+
+function repairForkJoinNodes(workflow, forkType) {
   const nodes = workflow.nodes || [];
   const edges = workflow.edges || [];
   const nodeMap = new Map(nodes.map((n) => [n.id, n]));
 
   for (const node of nodes) {
-    if (node.type !== "branch") continue;
+    if (node.type !== forkType) continue;
     const outs = edges.filter((e) => e.from === node.id && nodeMap.has(e.to) && e.from !== e.to);
     const usedLabels = new Set();
     for (const e of outs) {
       let raw = String(e.label || "").trim();
       if (!raw || usedLabels.has(raw)) {
-        raw = nextUniqueBranchLabel(usedLabels);
+        raw =
+          forkType === "parallel"
+            ? nextUniqueParallelLabel(usedLabels)
+            : nextUniqueBranchLabel(usedLabels);
         e.label = raw;
       }
       usedLabels.add(raw);
@@ -411,18 +479,29 @@ function repairBranchNodes(workflow) {
       nodes.push({
         id: newStepId,
         type: "step",
-        text: "补充分支步骤",
+        text: forkType === "parallel" ? "并行臂步骤" : "补充分支步骤",
         x: Number(node.x || 0) + 280,
         y: Number(node.y || 0) + outs.length * 96
       });
       nodeMap.set(newStepId, nodes[nodes.length - 1]);
-      const label = nextUniqueBranchLabel(usedLabels);
+      const label =
+        forkType === "parallel"
+          ? nextUniqueParallelLabel(usedLabels)
+          : nextUniqueBranchLabel(usedLabels);
       const edge = { id: uid("e"), from: node.id, to: newStepId, label };
       edges.push(edge);
       outs.push(edge);
       usedLabels.add(label);
     }
   }
+}
+
+function repairBranchNodes(workflow) {
+  repairForkJoinNodes(workflow, "branch");
+}
+
+function repairParallelNodes(workflow) {
+  repairForkJoinNodes(workflow, "parallel");
 }
 
 export function normalizeWorkflow(raw) {
@@ -483,6 +562,7 @@ export function normalizeWorkflow(raw) {
   if (out.subworkflows && !Object.keys(out.subworkflows).length) delete out.subworkflows;
 
   repairBranchNodes(out);
+  repairParallelNodes(out);
   out.edges = filterEdgesAcyclic(out.edges || []);
   layoutWorkflowLeftToRight(out);
   return out;
@@ -572,7 +652,7 @@ export function mwglToWorkflow(text) {
   }
 
   if ((mode === "graph" || graphNodes.length > 0) && graphNodes.length) {
-    const fallback = { start: 120, step: 400, branch: 380, end: 720 };
+    const fallback = { start: 120, step: 400, branch: 380, parallel: 380, end: 720 };
     const nodes = graphNodes.map((n, idx) => {
       const ty = NODE_TYPES.includes(n.type) ? n.type : "step";
       const base = {

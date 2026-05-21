@@ -91,7 +91,7 @@ const DEFAULT_LLM_SCORER = {
 };
 
 const TERMINAL_TYPES = new Set(["end"]);
-const NON_TERMINAL_TYPES = new Set(["start", "step", "branch"]);
+const NON_TERMINAL_TYPES = new Set(["start", "step", "branch", "parallel"]);
 
 function deepClone(value) {
   return JSON.parse(JSON.stringify(value || {}));
@@ -329,13 +329,14 @@ function canReachTerminal(workflow, fromNodeId) {
 
 const MWGL_V3_HARD_RULES_ZH = [
   "【结构】全图为 DAG；禁止自环；end 禁止出边。",
-  "【类型】仅 start | step | branch | end；end 须含 outcome: success | failure。",
+  "【类型】仅 start | step | branch | parallel | end；end 须含 outcome: success | failure。",
   "【入口】唯一 start，无入边，至少一条出边。",
   "【步骤】step 最多 1 条出边。",
-  "【分支】branch 至少 2 条出边；每条出边 label 非空、不重复、有业务语义（禁纯数字/分支N）。",
+  "【分支】branch 至少 2 条出边；每条出边 label 非空、不重复、有业务语义（禁纯数字/分支N）；条件择一必须用 branch。",
+  "【并行】尽可能不用 parallel；仅用户明确要同时执行多臂时用。parallel 至少 2 条出边，label 为臂名称；各臂须汇合到同一后续节点。",
   "【终态】至少一个从 start 可达的 end；可达非 end 节点须能到达 end。",
   "【失败】outcome=failure 的 end 文案须具体，不能仅写「失败」。",
-  "【规模】节点数 ≤ max_nodes。循环/并行不在图中建模，写在 step 文案或由代码生成处理。"
+  "【规模】节点数 ≤ max_nodes。循环挂在 step.loop，不入主图 edges。"
 ].join("\n");
 
 const OPERATOR_SELECT_SYSTEM_ZH = [
@@ -358,7 +359,7 @@ const LLM_GENERATE_SYSTEM = [
   "你是 MWGL v3 工作流合法改写模型。输出完整 JSON 工作流，无 markdown。",
   MWGL_V3_HARD_RULES_ZH,
   "顶层：mwgl_version:3, rule_id, rule_name, nodes, edges。nodes：id,type,text,x,y；type=end 时含 outcome。edges：id,from,to,label。",
-  "type 枚举：start, step, branch, end。"
+  "type 枚举：start, step, branch, parallel, end。"
 ].join("\n");
 
 /** 束搜索 / MCTS 扩展时按「内容」「结构」分支注入 system 侧重点 */

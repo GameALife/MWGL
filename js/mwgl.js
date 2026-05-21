@@ -11,6 +11,7 @@ export {
   migrateWorkflowV2ToV3,
   mwglToWorkflow,
   normalizeWorkflow,
+  parallelJoinStatus,
   validateWorkflowConstraints,
   wouldEdgeCreateCycle,
   workflowToMwgl

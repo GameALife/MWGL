@@ -35,7 +35,7 @@ npm start
 | http://localhost:3001 | 前端 Studio（`index.html`） |
 | http://localhost:3001/api/health | 健康检查（是否配置 Key） |
 
-**运行代码自检**（可选）需本机安装 `python3`、`node`（用于 Python / JavaScript 语法与执行检测）。
+**运行代码自检**（可选）需本机安装对应工具链：`python3`（Python）、`node`（JavaScript）、`javac`/`java`（Java）、`go`（Go）、`g++`（C++）。
 
 > 不要用 `file://` 直接打开 `index.html`，否则模块与 API 请求会失败。
 
@@ -61,7 +61,7 @@ flowchart LR
 | NL → DAG | DeepSeek 单次生成 + 校验与自动修复重试 |
 | DAG → 伪代码 | LLM **逐节点润色** + 程序按图 **确定性拼装**（含 `# [nodeId]`） |
 | 伪代码 → 代码 | LLM **逐节点函数** + 程序拼装 `main`；`workflow` 必填 |
-| 运行检测 | Python：`py_compile` + 执行；JS：`node --check` + 执行 |
+| 运行检测 | Python：`py_compile` + 执行；JS：`node --check` + 执行；Java：`javac` + `java`；Go：`go run`；C++：`g++` + 执行 |
 | 报错修复 | 将 `run-check` 结果回传 LLM，默认最多 2 轮（`MWGL_CODE_REPAIR_MAX_RETRY`） |
 
 ## MWGL v3 简介
@@ -225,7 +225,7 @@ MWGL 用**有向图**表示业务流程：
 }
 ```
 
-支持 `Python`、`JavaScript`、`Java`、`Go`、`C++`（**运行检测**仅 Python/JS）。逐节点生成 `node_*` 函数后拼装 `main`。
+支持 `Python`、`JavaScript`、`Java`、`Go`、`C++`（**运行检测**五种语言均支持，需本机安装对应编译器/解释器）。逐节点生成 `node_*` 函数后拼装 `main`。
 
 ### `POST /api/mwgl/run-check`
 
@@ -327,7 +327,7 @@ MCTS：`top4_search_mode": "mcts"`，可选 `top4_mcts_extra_rounds`、`top4_mct
 | 页面空白或 API 失败 | 必须用 `http://localhost:PORT` 访问，不要 `file://` |
 | 生成报错 | 检查 `DEEPSEEK_API_KEY`、`DEEPSEEK_API_BASE` |
 | 优化报错 requires Qwen | 配置 `QWEN_API_KEY`、`QWEN_BASE_URL`、`QWEN_MODEL` |
-| 运行检测失败 | 看「运行日志」Tab；Python/JS 需本机 `python3`/`node`；可点「根据报错修复」 |
+| 运行检测失败 | 看「运行日志」Tab；确认本机已安装对应工具链（见上文）；可点「根据报错修复」 |
 | 代码修复后仍失败 | 增大 `MWGL_CODE_REPAIR_MAX_RETRY` 或手动改代码 / 重新生成 |
 | 约束不通过 | 侧栏约束列表；`branch` label 要有语义；`failure` end 文案要具体 |
 | 图编辑报错 | 检查 `ROBUSTFLOW_ROOT` 与 Python 依赖，或 `lexical_fallback: true` |

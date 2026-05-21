@@ -47,16 +47,20 @@ export const DEFAULT_SCORE_WEIGHTS = {
   ...PENALTY_SCORE_WEIGHTS
 };
 
-/** 结构分各项加分（0.1 步长；满分项相加为 1.1，再 clamp 到 1） */
+/**
+ * 结构分：仅含 validateWorkflowConstraints 不强制、但能区分合法图质量的维度。
+ * 进度/分支 label 合法性等已由硬性检测保证，不再重复计分。
+ */
 export const STRUCTURAL_SCORE_WEIGHTS = {
-  reach: 0.2,
-  successEnd: 0.4,
-  failureEnd: 0.1,
-  progressOk: 0.2,
-  branchValid: 0.1,
-  branchInvalid: 0,
+  /** 从 start 可达节点占比（允许存在不可达孤岛，硬性检测不罚） */
+  reach: 0.25,
+  /** 硬性检测只要求「有可达 end」，不强制 success 终态 */
+  successEnd: 0.35,
+  failureEnd: 0.15,
+  /** 无 branch 的简单流仍给少量加分（硬性检测不强制要有分支） */
   noBranch: 0.1,
-  loop: 0.1
+  /** 含 loop.steps 的 step（硬性检测不强制要有循环） */
+  loop: 0.15
 };
 
 function clamp(num, min, max) {
@@ -248,12 +252,7 @@ function scoreStructural(ctx) {
   s += w.reach * clamp(reachRatio, 0, 1);
   if (ctx.hasSuccess) s += w.successEnd;
   if (ctx.hasFailure) s += w.failureEnd;
-  if (ctx.progressOk) s += w.progressOk;
-  if (ctx.branchCount > 0) {
-    s += ctx.validBranchLabels ? w.branchValid : w.branchInvalid;
-  } else {
-    s += w.noBranch;
-  }
+  if (ctx.branchCount === 0) s += w.noBranch;
   if (ctx.hasLoop) s += w.loop;
   return clamp(s, 0, 1);
 }

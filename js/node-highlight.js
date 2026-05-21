@@ -3,6 +3,7 @@ const TYPE_COLORS = {
   start: { bg: "#d1fae5", border: "#10b981", label: "start" },
   step: { bg: "#dbeafe", border: "#2563eb", label: "step" },
   branch: { bg: "#fef3c7", border: "#d97706", label: "branch" },
+  parallel: { bg: "#e0f2fe", border: "#0284c7", label: "parallel" },
   end: { bg: "#bbf7d0", border: "#16a34a", label: "end" },
   "end-success": { bg: "#bbf7d0", border: "#16a34a", label: "end·success" },
   "end-failure": { bg: "#fecaca", border: "#dc2626", label: "end·failure" },
@@ -84,7 +85,11 @@ export function buildPseudoLineNodes(text, workflow) {
       result.push({ nodeId: null, edgeId: null, structural: true });
       continue;
     }
-    if (/^\s*(IF|ELSE IF|ELSE|END IF|FOR|WHILE|END FOR|END WHILE)\b/i.test(line)) {
+    if (
+      /^\s*(IF|ELSE IF|ELSE|END IF|PARALLEL|ARM|END PARALLEL|FOR|WHILE|END FOR|END WHILE)\b/i.test(
+        line
+      )
+    ) {
       result.push({ nodeId: currentNodeId, edgeId: null, structural: true });
       continue;
     }

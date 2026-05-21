@@ -1033,6 +1033,56 @@ button:hover {
 .node.start { background: var(--event); }
 .node.step { background: var(--case); }
 .node.branch { background: var(--switch); }
+.node.parallel {
+  background: var(--parallel);
+  border: 2px solid #0284c7;
+}
+.node.parallel.parallel-no-join {
+  border-color: #dc2626;
+  box-shadow: 0 0 0 2px rgba(220, 38, 38, 0.2);
+}
+.node-join-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  border-radius: 4px;
+  vertical-align: middle;
+}
+.node-join-ok {
+  background: #dbeafe;
+  color: #0369a1;
+}
+.node-join-warn {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+.fork-hint {
+  margin: 8px 0 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #f0f9ff;
+  border: 1px solid #bae6fd;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #0c4a6e;
+}
+.fork-hint-text {
+  margin: 0;
+}
+.field-hint {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: #64748b;
+  line-height: 1.4;
+}
+.edge-line.edge-from-branch {
+  stroke: #d97706;
+}
+.edge-line.edge-from-parallel {
+  stroke: #0284c7;
+}
 .node.end,
 .node.end-success { background: var(--success-bg); }
 .node.end-failure { background: var(--failure-bg); }
